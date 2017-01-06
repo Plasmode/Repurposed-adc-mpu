@@ -1,0 +1,3031 @@
+* 12/15/16 Add "xt" command to set real time clock.  "xt"" shows time, "xt yymmddhhmmss"
+* set time and transmit time information over Xbee, if present.
+* 12/14/16 write "rts" in $2f3010 during initialization.  In foreground loop execute
+* bsr $2f3010.  This allow an user program to load into $2f3010 and included in the 
+* foreground execution.
+* 12/9/16 change the way LCD display is detected:  use d3 bit of $300060 to check
+* LCD display.  That bit is nominally pulled up with 10K resistor.  Ground it for LCD display
+* Design interactive session for mm and mr commands so it is called from the top
+* a state, sInteractive, is used to indicate whether it is mm or mr interactive session
+* 12/5/16 going to version 1.1x to reflect the approach of keeping core AMbug fuctions 
+* apart from applications such as LCD display and Xbee.
+* LCD display will be a separate task with its variables kept in 2F1000 while Xbee's task
+* variables are in 2F2000.
+* 12/2/16 Have 8 pages for display using toggle switches.
+* Page 0 is home page, default (such as idle count)
+* page 1-7 are user definable
+* Each page has a table defines:
+*   pLnxLCD (x=1 to 4) that points to variable to be printed
+*   LnxLabel (x=1 to 4) print label first before the variable. Value lesser than 0x20
+*   is the terminating character which indicates the end of label string and starting 
+*   print variables.  Terminating character also define how variable is to be printed,
+*   0=ASCII, 1=Hex, 2=decimal...
+* 11/30/16 Each line of LCD display can be at different location.  pLn1LCD points to 
+* first line, pLn2LCD second line, etc.  The msb byte of each pointer defines how the
+* data is to be displayed: 0x0 means as is (ASCII), 0x1 means hex.  A 80-byte buffer
+* is filled data to be displayed which is refreshed at the beginning of display.
+* LCD display can be dynamically detected while program is running
+* 11/28/16 v1.04, think in term of task oriented foreground loop.  Calling idle, command 
+*  processing, LCD display driver (where applicable)
+* 11/7/16 bug fixed in prog010b
+* 4/4/15 add diagnostics to understand why in breakpoint mode, a carriage return does not
+*   cause a trace instruction to be executed like other boards
+* 3/30/15, fork from AMbugr v0.91
+* with updated S record loader, should be able to org to $400 with exception vector at $0
+* ADC MPU bug for RAM
+* desirable commands for near-term development:
+* cp copy source to destination
+* du dump memory content
+* as assemble
+* ds disassemble
+* up zmodem upload
+* dn zmodem download
+* 4/2 v1.01, modify 'sw' so if loc 0x0 is modifiable, don't switch
+* 4/4 v1.02, 'Z' command will now clear a 16K block RAM starting $2F8000
+
+BAR	equ $0F2 *Base Address Register
+SCR	equ $0F4 *System Control Register
+CKCR	equ $0F6 *Clock Control Register
+base	equ $FFF000
+GIMR	equ base+$812 *Global Interrupt Mode Register
+IPR	equ base+$814 *Interrupt Pending Register
+IMR	equ base+$816 *Interrupt Mask Register
+ISR	equ base+$818 *In-Service Register
+SIMODE	equ base+$8B4 *Serial Interface Mode Register
+SCON1	equ base+$882 *SCC1 Configuration Register
+SCM1	equ base+$884 *SCC1 Mode Register
+SCCE1	equ base+$888 *SCC1 Event Register
+SCCM1	equ base+$88A *SCC1 Mask Register
+ENSCC	equ $0C *ENR and ENT bits in SCM
+TMR1	equ base+$840	* timer1 mode reg
+TRR1	equ base+$842	* timer1 reference reg
+TCN1	equ base+$846	* timer1 counter
+TER1	equ base+$849	* timer1 event reg
+PACNT	equ base+$81E	* port A control register
+PADDR	equ base+$820	* port A Data Direction Reg
+PADAT	equ base+$822	* port A Data Reg
+PBCNT	equ base+$824	* port B control reg
+PBDDR	equ base+$826	* port B Data Direction Reg
+PBDAT	equ base+$828	* port B Data Reg
+
+DUART	equ $300020	* base address of 68692 DUART
+MRA	equ $300020	* mode reg A
+SRA	equ $300022	* status A (read)
+CSRA	equ $300022	* clock select reg (write)
+CRA	equ $300024	* command register (write only)
+RHRA	equ $300026	* Rx Hold reg A (read)
+THRA	equ $300026	* Tx Holding reg (write)
+IPCR	equ $300028	* Input port change reg (read)
+ACR	equ $300028	* Aux control reg (write)
+ISRD	equ $30002A	* interrupt status reg (read)
+IMRD	equ $30002A	* interrupt mask reg (write)			
+CTU	equ $30002C	* Counter/timer upper (read)
+CTL	equ $30002E	* counter/timer lower (read)
+MR1B	equ $300030	* mode reg B
+SRB	equ $300032	* status reg B
+RHRB	equ $300036	* Rx holding reg B
+IVRD	equ $300038	* interrupt vector reg
+
+True	equ 0
+False	equ 1
+Error	equ $ff
+
+	org	$2F0000		* top 64K of RAM is for stack and global variables
+				* the RAM is backed by superCAP
+ROMver	ds.l 1			* this is 1st variable of a task descriptor block
+wallclock ds.l 1		* global wall clock
+downtimer ds.w 2		* this is always the 3rd variable of a TDB
+amrsvp	ds.l 1			* reserve fix long word for future
+
+savd0	ds.l 1			* allocate for 68302 registers
+savd1	ds.l 1
+savd2	ds.l 1
+savd3	ds.l 1
+savd4	ds.l 1
+savd5	ds.l 1
+savd6	ds.l 1
+savd7	ds.l 1
+sava0	ds.l 1
+sava1	ds.l 1
+sava2	ds.l 1
+sava3	ds.l 1
+sava4	ds.l 1
+sava5	ds.l 1
+sava6	ds.l 1
+savsp	ds.l 1
+savpc	ds.l 1
+	
+cUErr	ds.w 1
+fWval	ds.b 1			* write flag
+fSerr	ds.b 1			* S record error
+pStr	ds.l 1			* string pointer for DUARTisr
+bAnswer	ds.l 5			* 16 bytes of response buffer, byte order:
+			* LF, CR, A, A, A, A, A, A, ':', 
+			* D, D, D, D, LF, CR, '>', ' ', 0
+bCmdline ds.l 5		* command line, handle up to 20 characters
+pCmdln	ds.l 1		* pointer into the command line buffer
+cCmd	ds.b 1		* count number of bytes in command buffer
+fDoCmd	ds.b 1		* flag for command ready to execute	
+cCmdparam ds.b 1	* number of command parameters
+fCmdDone ds.b 1		* flag for command in progress (0) or done (1)
+cmdparam ds.l 4		* command parameters
+RegASCII ds.b 10		* ASCII value of a register, null terminated
+am3reserve ds.b 2	* reserve
+cntIdle	ds.l 1		* idle loop counter
+maxIdle	ds.l 1		* Idle loop count for this time period
+nullchar ds.b 2		* string terminator, two characters, 
+			* one will be modified for mr command use
+fTxDone	ds.b 1		* flag for ISR finishs transmitting string
+fbpverbose ds.b 1	* verbose flag for breakpoint
+bkptaddr ds.l 1		* address where illegal instruction is inserted
+bkptinstr ds.w 1	* instruction swapped out for breakpoint
+fdobkpt	ds.b 1		* indicating whether breakpoint is in progress or not
+fSerrAll ds.b 1		* reserve byte
+cTrace	ds.w 1		* number of trace to perform
+seconds	ds.b 1		* time register (seconds) in RTC72423
+sInteractive ds.b 1	* Interactive session state, 0=none, 1=mm cmd, 2=mr cmd, 3=xs, 4=xd
+startaddr ds.l 1	* starting address for the S record file load
+idlecnt	ds.l 1		* idle loop count, Range of its value decides LED color
+mmaddress ds.l 1	* address value from mm command saved for interactive session
+rtctime	ds.b 20		* Last read value of the real time clock, rtc72423, in ascii
+rtctimebcd ds.b 6	* real time clock value in packed bcd, yymmddhhmmss
+exitCode ds.b 1		** error code for command execution.  0=normal, 1=error
+am1reserve ds.b 1	** reserve 
+
+	org	$0
+* reset vector
+	dc.l $2F0FFC		* stack at the top task space
+	dc.l AMbug	* start address of AMbug
+	dc.l buserr	* BERR handler
+	dc.l addrerr	* address error handler
+	dc.l breakpt	* illegal instruction used as breakpoint
+	dcb.l 4,unknown
+	dc.l trace	* trace handling
+	dcb.l 50,unknown	* set the rest to unknown which just
+					* blink red/green light rapidly
+	org $100		* skip over $F0-$FF, system area for 68302
+	dcb.l 65,unknown
+
+*	dc.l unknown	* No. $80, Error
+
+	dc.l DUARTisr	* No. $81, service DUART connected to PB8
+
+*	dc.l unknown	* No. $82, SMC2
+*	dc.l unknown	* No. $83, SMC1
+*	dc.l unknown	* No. $84, Timer3
+*	dc.l unknown	* No. $85, SCP
+*	dc.l unknown	* No. $86, Timer2
+*	dc.l unknown	* No. $87, PB9
+	dcb.l 6,unknown
+	dc.l Xbeeisr	* No. $88, SCC3
+	dc.l timer1isr	* No. $89, service the 10ms OS timer
+
+*	dc.l unknown	* No. $8A, SCC2
+*	dc.l unknown	* No. $8B, IDMA
+*	dc.l unknown	* No. $8C, SDMA BERR
+*	dc.l unknown	* No. $8D, SCC1
+*	dc.l unknown	* No. $8E, PB10
+*	dc.l unknown	* No. $8F, PB11
+*	dc.l unknown	* No. $90
+*	dc.l unknown	* No. $91, Extern
+*	dc.l unknown	* No. $92
+*	dc.l unknown	* No. $93
+*	dc.l unknown	* No. $94
+*	dc.l unknown	* No. $95
+*	dc.l unknown	* No. $96, Extern
+*	dc.l unknown	* No. $97, Extern
+	dcb.l 118,unknown	* the rest to unknown
+
+	org $400		* not necessary, but just in case...
+AMbug:
+	move.w #$2700,sr	* mask off interrupts
+	move.w #$0FFF,BAR	* BAR points to 0xFFFxxx
+	lea $2F0FFC,sp		* initialize stack to top of task descriptor block
+***
+* RAM and boot flash are switched in this board
+* initialize ORx first before BRx
+*	move.w #$3C00,$FFF832 	* OR0, 1 wait, R/W, 2048K space
+*	move.w #$3800,$FFF832 	* OR0, 1 wait, R/W, 4096K space, aliased
+*	move.w #$C001,$FFF830 	* BR0, $0, CS0 RAM
+*	move.w #$3F80,$FFF836	* OR1, 1 wait, R/W, 256K space
+*	move.w #$401,$FFF834	* BR1, $200000, CS1, Boot flash
+*	move.w #$CC01,$FFF834	* BR1, $600000, CS1, Boot flash
+**********AMbugb******************
+	move.w #$3F80,$FFF832 	* OR0, 1 wait, R/W, 256K space
+	move.w #$C001,$FFF830 	* BR0, $0, CS0 Flash
+	move.w #$3800,$FFF836	* OR1, 1 wait, R/W, 4096K space, aliased
+	move.w #$401,$FFF834	* BR1, $200000, CS1, RAM
+**********AMbugb******************
+	move.w #$3E00,$FFF83A 	* OR2, 1 wait, R/W, 1024K space
+	move.w #$801,$FFF838 	* BR2, $400000, CS2
+	move.w #$3E00,$FFF83E 	* OR3, 1 wait, R/W, 1024K space
+	move.w #$A01,$FFF83C 	* BR3, $500000, CS3
+restart:
+	reset
+	bra entry
+
+* User command dispatch tables
+* the "-$12" is derived by trial and error.  Don't know why it works this way
+commands:
+	dc.l do_dm-exec_cmd-$12	* display memory
+	dc.l do_dr-exec_cmd-$12	* display register
+	dc.l do_mm-exec_cmd-$12	* modify memory
+	dc.l do_mr-exec_cmd-$12	* modify register
+	dc.l do_go-exec_cmd-$12	* go
+	dc.l do_bp-exec_cmd-$12	* breakpoint
+	dc.l do_sw-exec_cmd-$12	* switch RAM/ROM
+	dc.l do_help-exec_cmd-$12	* help message
+	dc.l do_cp-exec_cmd-$12	* copy source to destination
+	dc.l do_du-exec_cmd-$12	* dump memory content command
+	dc.l do_xt-exec_cmd-$12	* set or display timer, rtc72423
+	dc.l do_xo-exec_cmd-$12 * turn on every station's periodic transmitter
+	dc.l do_xx-exec_cmd-$12 * turn off every station's periodic transmitter
+	dc.l do_xe-exec_cmd-$12 * erase data in a station's logger
+	dc.l do_xd-exec_cmd-$12 * dump a station's log
+	dc.l do_xs-exec_cmd-$12 * display station's status
+* corresponding mnemonic for the user command table
+mnemonictbl:
+	dc.w 'dm'
+	dc.w 'dr'
+	dc.w 'mm'
+	dc.w 'mr'
+	dc.w 'go'
+	dc.w 'bp'
+	dc.w 'sw'
+	dc.w 'he'
+	dc.w 'cp'
+	dc.w 'du'
+	dc.w 'xt'
+	dc.w 'xo'
+	dc.w 'xx'
+	dc.w 'xe'
+	dc.w 'xd'
+	dc.w 'xs'
+	dc.w $0
+	
+entry:
+	move.w #$80,GIMR	* normal mode, vector no 80-9F
+	move.w #0,IMR		* mask off all interrupts
+	move.w #$FFFF,IPR	* clear all pending interrupts
+	move.w #$FFFF,ISR	* clear all in-service bits
+	move.w #$0,PBCNT	* enable TIN1 as PB3
+	move.w #$0408,PBDDR	* PB10 and PB3 are outputs
+	move.w #$0408,PBDAT	* assert PB3 and PB10 output, light should be green	
+	move.l #$1e1e1e1e,$2f0ffc	* mark memory beyond top of the stack as a
+				* way to check stack underflow		
+	clr.l d1		* clear all data and address registers, except a5
+	clr.l d2
+	clr.l d3
+	clr.l d4
+	clr.l d5
+	clr.l d6
+	clr.l d7
+	lea $0,a1
+	lea $0,a2
+	lea $0,a3
+	lea $0,a4
+	lea $0,a6
+	move.w #3,d0		* clear fixed task variables in 4 task areas
+	lea $2f0000,a0
+taskvars:
+	clr.l (a0)+		* version 
+	clr.l (a0)+		* wall clock
+	clr.l (a0)		* count down timers
+	add.l #$ff8,a0		* next task descriptor block
+	dbra d0,taskvars
+	move.l #$30313138,ROMver	* version number of active tasks are in $2Fx000
+				* need a better way of doing this
+* initialize timer1 which will serve as operating system 10ms timer
+	move.w #$f1b,TMR1	* enable timer, use master clock, restart, enable 
+				* interrupt, capture disabled, prescaler of 16
+	move.w #10000,TRR1	* equivalent to 10mS with 16MHz master clock
+	clr.w TCN1		* clear timer counter
+	clr.l bkptaddr		* no breakpoint
+	clr.b fdobkpt
+	move.b #1,fbpverbose	* the verbose flag for breakpoint
+	bsr iBuffer
+	clr.b cCmd		* clear command line state
+	clr.b fDoCmd		* clear command ready to execute flag
+	clr.b fCmdDone		** 
+	move.l #bCmdline,pCmdln	* initialize command line pointer to the beginning
+	clr.b sInteractive	* set interactive session state to none
+	clr.w nullchar		* null terminator for the register string
+	bsr iDUART
+	clr.b fSerr		* clear s record error flag
+	move.b #' ',RegASCII+8	* put a space character at the end of register string
+	clr.b RegASCII+9	* null terminate the register string
+	clr.b fSerrAll		* clear cumulated S record error flag
+	move.l #300000,idlecnt	* init idle counter value to green
+	move.b #$4,$30005F	* this is the reset register of RTC72423.  run in 24 hr mode
+	move.b $300041,seconds	* read the time register
+	and.b #$f,seconds	* only the low nibble contains valid data
+	clr.l cntIdle		* reset idle loop counter
+	move.w #$4e75,$2f3010	* "rts" instruction in task 4 entry point
+	btst.b #3,$300061	* bit 3 is nominally pullup via 10K resistor
+				* ground it to indicate LCD display presence
+	bne task2init
+	bsr initLCD		* initialize 4x20 LCD display
+task2init:		
+	btst.b #0,$300060	* look for data bit 8@$300060.  If clear, initialize Xbee
+	bne mpuinit1
+	bsr initXbee
+mpuinit1:
+	lea signon(pc),a0	* relocatable code
+	move.l a0,pStr		* pStr points to the signon message
+	move.w #5,CRA		* enable transmit and receive
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts
+	move.w #$202,IMR	* enable DUART interrupt (PB8 on 68302) and timer1
+	btst.b #0,$300060	* if Xbee present, enable SCC3 interrupt
+	bne mpuinit2
+	or.w #$100,IMR		* enable SCC3 interrupt
+mpuinit2:
+	move.w #$2000,SR	* lower interrupt level
+******************************************
+* foreground loop
+fore:
+	bsr idleled		* idle routine changing LED color
+	bsr AMbugCmd		* processing console command
+	btst.b #3,$300061	* bit 3 is nominally pullup via 10K resistor
+				* ground it to indicate LCD display presence
+	bne fore7
+	bsr LCDstart		* update 4x20LCD display (if installed)
+fore7:
+	btst.b #0,$300060	* look for data bit 8@$300060.  If clear, run Xbee
+	bne fore7a
+	bsr Xbee
+	jsr $2f3010		* task 4 entry point, rts if no program there
+				* don't use bsr, it is PC-relative 
+fore7a:
+* counting the number of idle loop per second gives a good idea of CPU utilization
+* another way is to check the min/max value in a second.  Save that project for another time
+	move.b $300041,d0	* read the time register
+	and.b #$F,d0		* only the low nibble is valid
+	cmp.b seconds,d0	* has the second rolls over?
+	beq fore9
+	move.l cntIdle,maxIdle	* save the idle value for this time period
+	clr.l cntIdle
+	move.b d0,seconds	* update with new value
+fore9:
+	add.l #1,cntIdle	* increment idle loop counter
+	bra fore
+******************************************
+idleinit:
+	move.l #100000,idlecnt
+	move.w #$408,PBDAT	* green
+idleled:
+	sub.l #2,idlecnt
+	cmp.l #100000,idlecnt	* force d5 between 0-100000
+	bgt idleinit
+	cmp.l #0,idlecnt
+	ble idleinit	
+	cmp.l #70000,idlecnt
+	bne idle1
+	move.w #$0400,PBDAT	* amber
+idle1:
+	cmp.l #40000,idlecnt
+	bne idle9
+	move.w #0,PBDAT		* red
+idle9:
+	rts
+
+AMbugCmd:
+* when in interactive session, look for difference sources of inputs depending on the session
+* session #1, looks for fDoCmd ready (keyboard inputs)
+* interactive session of mm command	
+	tst.b sInteractive
+	beq doCmd
+	movem.l a0-a5/d0-d7,-(sp)	** save registers 
+	cmp.b #1,sInteractive
+	bne interact1
+	tst.b fDoCmd
+	beq dodo9		**
+**	beq dodo9n
+**	movem.l a0-a5/d0-d7,-(sp)	* save registers 
+	bsr mminteractive	* mm command interactive session
+**	bra dodo8		
+	bra dodo9		**
+interact1:
+* interactive session of xs command
+	cmp.b #3,sInteractive
+	bne interact4
+**	movem.l a0-a5/d0-d7,-(sp)	* save registers 
+	tst.w downtimer		* if timer timed out, terminate the interactive session
+	beq interact3err
+	tst.b fxbeeresp		* the expected response is from xbee
+	beq dodo9
+	bsr xsinteractive
+**	bra dodo8
+	bra dodo9		**
+interact3err:
+	bsr xsinteract8
+**	bra dodo8
+	bra dodo9
+interact4:
+* this is the interactive session following the "xd station#" command.  The command set
+* a timeout value of 0.5 second.  In the interactive session, it will check for timeout,
+* xbee response flag (fxbeeresp), and keyboard entry.  When timeout is detected, it clears
+* sInteractive flag and send a "xd cancel" command.  Same action when a CR is detected.
+* When a xbee response is detected (fxbeeresp set), it clear fxbeeresp, set timeout to 0.5 
+* second, move the data in bxbeeresp to data log area, and put out a period (.) to console
+* for every 10 responses received
+
+	cmp.b #4,sInteractive
+	bne interact5
+**	movem.l a0-a5/d0-d7,-(sp)	* save registers 
+	tst.w downtimer
+	beq interact4timeup
+	tst.b fDoCmd		* is there a console input? CR will terminate the session
+	bne interact4cr
+	tst.b fxbeeresp		* response packet received from xbee?
+	beq dodo9		* nothing to do, return
+	bsr xdinteractive
+**	bra dodo8
+	bra dodo9		**
+interact4cr	
+	bsr xdinteract8cr
+**	bra dodo8
+	bra dodo9		**
+interact4timeup:
+	bsr xdinteract8tu
+**	bra dodo8
+	bra dodo9		**
+
+interact5:
+* sInteractive=5 is for xd command issued without parameter, it is for displaying of data
+* stored in the local data logger.  Any input from console will exit this session
+* One set of temperature data will output to console each time AMbug task is called
+* pxdlogger points to current set of temperature data and format it to yy/mm/dd hh:mm:ss
+* then temperature in farenheit. pxdlogger is updated to next data set when task exit.
+* When pxdlogger == plogger, session flag is cleared.  
+
+
+	cmp.b #5,sInteractive
+	bne interact9
+**	movem.l a0-a5/d0-d7,-(sp)	* save registers 
+	tst.b fDoCmd		* any console input with CR will terminate the session
+	bne interact5cr
+	move.l pxdlogger,d0
+	cmp.l plogger,d0	* session done when pxdlogger is equal or higher than plogger
+	bhs interact5dn
+	bsr xdinteractive5
+**	bra dodo8
+	bra dodo9		**
+interact5dn:
+	bsr xdinteract5dn
+**	bra dodo8
+	bra dodo9		**
+interact5cr:
+	bsr xdinteract5cr
+**	bra dodo8
+	bra dodo9		**
+	
+interact9
+	clr.b sInteractive		* error condition, 
+* should print error message 
+**	bra badcommand
+	bra dodo9		**
+	
+	
+doCmd:	
+	tst.b fDoCmd		* Is a keyboard command ready for execution?
+**	beq dodo9n	
+	beq doPrompt		** check if prompt needs to be output
+cmdtodo:
+	movem.l a0-a5/d0-d7,-(sp)	* save registers 
+
+	cmp.b #2,cCmd		* need at least 2 char in command line before
+				* a valid CR
+	blo badcommand
+	lea mnemonictbl(pc),a0	* point to command mnemonic
+	lea commands(pc),a1	* the corresponding command entry point
+	move.w bCmdline,d0	* current command
+parsecmd:
+	cmp.w (a0)+,d0		* look for command
+	beq cmdproc
+	add.l #4,a1		* bump to next command
+	cmp.w #0,(a0)		* end of mnemonic table?
+	beq badcommand
+	bra parsecmd
+cmdproc:
+	bsr cmdreformat
+	clr.b cCmd		* ready for next command while current command is running
+	clr.b fDoCmd
+	move.l #bCmdline,pCmdln
+	tst.l d0
+	bne badcommand
+	move.l (a1),a1		* get the actual subroutine address in a1
+exec_cmd:
+	jsr (pc,a1)
+	bra dodo9		**
+	
+doPrompt:		**
+** check fCmdDone.  If set, issue a prompt depend on the exit code.  check fTxDone first
+** to make sure previous output has completed.
+	tst.b fCmdDone	** every command subroutine should mark completion with fCmdDone set
+	beq dodo9n	** end of AMbug task list
+	cmp.b #False,fTxDone	** check if still outputting previous message
+	beq dodo9n
+	movem.l a0-a5/d0-d7,-(sp)	** save registers
+	clr.b fCmdDone	** this is where fCmdDone is cleared
+	tst.b exitCode	** exit code of a command execution determines what prompt to display
+			** 0=normal exit, 1=error condition
+	beq OKcommand	** normal prompt
+	bra badcommand	** exit with error prompt
+	
+**dodo8:
+* don't like this approach because D0 may contains values returned from user program via 
+* 'go' command.  The content of D0 is unpredictable.  On the other hand, the value of D0
+* is displayed when user program terminates, so maybe this is all right...
+	cmp.w #0,d0		* test result to chose the right prompt, 0=normal prompt
+				* 1=error prompt, 2=no prompt (interactive session in progress)
+	beq OKcommand		* normal prompt
+	cmp.w #1,d0		* check for error condition
+	beq badcommand
+	cmp.w #2,d0		* chk for interactive session
+	beq dodo9		* interactive session in progress
+	bra OKcommand		* normal prompt for all other values
+badcommand:
+	pea qprompt(pc)		* load error prompt
+	move.l (sp)+,pStr
+	bra docommand9
+OKcommand:
+	pea prompt(pc)		* a different way to put string address into pStr
+	move.l (sp)+,pStr	* bounce off stack so no register is altered
+docommand9:
+	clr.b cCmd		* ready for next command
+	clr.b fDoCmd
+	move.l #bCmdline,pCmdln
+	move.w #3,IMRD		* enable tx/rx interrupt
+dodo9:
+	movem.l (sp)+,a0-a5/d0-d7	* restore registers
+dodo9n:
+	rts
+
+***********************
+*
+* convert ascii inputs to hex values in cmdline buffer into cmdparam
+* Able to hold up to 4 long word parameters in cmdparam, cCmdparam contains the number of param
+* d0.w returns valid values (0), or invalid values (1)
+cmdreformat:
+	movem.l d1-d2/a0/a1,-(sp)	* save
+	lea bCmdline+2,a0	* start after the command mnemonic
+* get rid of extra space characters
+* routine here to eliminate extra spaces and no space after the last parameter
+cmdrf0:
+	clr.b cCmdparam		* clear command parameter count
+	sub.b #2,cCmd		* if there are only two bytes, then there are no parameter
+	beq cmdrf7		* exit with zero parameter count
+	
+	cmp.b #' ',(a0)		* first space after command is different than subsequent space
+	bne cmdrf1
+	lea 1(a0),a0		* same as (a0)+
+	sub.b #1,cCmd		* reduce byte count for command line buffer
+cmdrf1:
+
+	move.b cCmd,d2		* d2 contains number of bytes in command buffer
+	ext.w d2		* sign extend, prepare for dbra operation
+	clr.l d1		* d1 accumulate each nibble of ASCII input
+	lea cmdparam,a1		* a1 points to parameters
+	bra cmdrf6
+cmdrf2:
+	move.b (a0)+,d0
+	cmp.b #' ',d0		* space is parameter delimiter
+	bne cmdrf3
+	add.b #1,cCmdparam	* increment parameter count
+	move.l d1,(a1)+	
+	clr.l d1		* ready for next parameter
+	bra cmdrf6
+cmdrf3:
+	bsr asc2hex	`	* accumulate valid ASCII into hex value
+	cmp.b #$FF,d0
+	beq cmdrf8
+	lsl.l #4,d1
+	add.b d0,d1
+cmdrf6:
+	dbra d2,cmdrf2
+	cmp.b #4,cCmdparam	* can't have more than 4 parameters
+	beq cmdrf8
+	add.b #1,cCmdparam	* last parameter
+	move.l d1,(a1)+
+cmdrf7:
+	clr.l d0		* signal a good command line
+	clr.b fCmdDone		* flag the command in progress
+	bra cmdrf9
+cmdrf8:
+	move.l #1,d0		* signal a bad command line
+	move.b #1,fCmdDone	* flag the command is finished
+cmdrf9:
+	movem.l (sp)+,d1-d2/a0/a1	* restore
+	rts
+
+*************************** User Commands ************************************
+* display memory in word, address, <count>
+do_dm:
+	clr.l d3		* loop count
+	and.l #$FFFFFFFE,cmdparam	* make sure address is even
+	move.l cmdparam,a0	* this is starting address to be displayed
+	cmp.b #0,cCmdparam
+	beq do_dm8		* no parameter, exit with error prompt
+	cmp.b #2,cCmdparam	* one or two parameters
+	bgt do_dm8
+	move.b #0,bAnswer+13	* modify the bAnswer message string so not to print prompt
+	cmp.b #1,cCmdparam
+	beq do_dm1		* do one line of display memory
+	move.l cmdparam+4,d3	* number of words to display
+	bra do_dm9	
+do_dm1:
+	move.l a0,d1		* copy of a0
+	move.w (a0)+,d0		* read the specified memory location
+	bsr compuAnswer		* forming the answer in buffer
+	move.l #bAnswer,pStr	* send out the answer
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts
+
+do_dm9:
+	cmp.b #True,fTxDone	* wait for string transmission done before returning
+	bne do_dm9		* OS swap task here
+	dbra d3,do_dm1
+	move.b #$a,bAnswer+13	* restore bAnswer message string to print prompt	
+	clr.l d0		* signal regular prompt
+	clr.b exitCode		** exit normally
+	bra do_dm9x
+do_dm8:
+	moveq.l #1,d0		* signal error prompt
+	move.b #1,exitCode	** exit with error
+do_dm9x:
+	move.b #1,fCmdDone	* flag the command is finished
+	rts
+* display register <a|d> <0-7>
+* dr without parameter displays all registers, dr a|d displays all address or data registers
+* dr a0-7 displays address a0-a7, dr d0-7 displays d0-d7
+do_dr:
+	movem.l d0-d7/a0-a7,savd0	* save data & addr registers into system RAM
+do_bp_dr:			* entry point for dr command in breapoint handler
+				* the register array is already saved, do not save again
+	move.l cmdparam,d2	* this is address or data register select
+	cmp.b #0,cCmdparam
+	beq do_dr1		* no parameter, display all registers
+	cmp.b #1,cCmdparam
+	bgt do_dr8		* greater than 1 parameters, exit with error prompt
+	cmp.l #$a,d2		
+	beq do_dr_a		* 1st parameter = $a 
+	cmp.l #$d,d2		
+	beq do_dr_d		* 1st parameter = $d
+	cmp.l #$a0,d2		* $a0 <= parameter <= $a7
+	blo do_dr8
+	cmp.l #$a7,d2
+	bhi do_dr_dx		* check for $d0-$d7
+	moveq.l #0,d1		* display just one register
+	sub.l #$a0,d2
+	move.l d2,d3
+	mulu.w #RegStrLen,d3	* compute string array address offset
+	lsl.l #2,d2		* compute register array offset
+	bra do_dra0_7
+do_dr_dx:
+	cmp.l #$d0,d2		* $d0 <= parameter <= $d7
+	blo do_dr8		* exit with error prompt
+	cmp.l #$d7,d2
+	bhi do_dr8		* exit with error prompt
+	moveq.l #0,d1		* display just one register
+	sub.l #$d0,d2
+	move.l d2,d3
+	mulu.w #RegStrLen,d3	* compute string array address offset
+	lsl.l #2,d2		* compute register array offset
+	bra do_drd0_7
+do_dr_a:
+	moveq.l #7,d1		* all 8 address registers
+	clr.l d3		* no string offset
+	clr.l d2		* no register array offset
+do_dra0_7:
+	lea savA0,a0
+	adda.l d2,a0
+	lea regA0(pc),a1
+	adda.l d3,a1
+	bra do_dr2
+do_dr_d:
+	moveq.l #7,d1		* display all data registers
+	clr.l d3		* no string offset
+	clr.l d2		* no register array offset	
+do_drd0_7:
+	lea savD0,a0
+	adda.l d2,a0
+	lea regD0(pc),a1
+	adda.l d3,a1
+	bra do_dr2	
+do_dr1:
+	lea savd0,a0		* point to the register array 
+	moveq.l #16,d1		* loop count +1
+	lea regD0(pc),a1
+do_dr2:
+	bsr do_dr_reg
+	adda.l #RegStrLen,a1	* increment to next message string
+	adda.l #4,a0		* next register in the register array
+	dbra d1,do_dr2
+do_dr9:	
+	clr.l d0
+	clr.b exitCode		** exit normally
+	bra do_dr9x
+do_dr8:
+	moveq.l #1,d0
+	move.b #1,exitCode	** exit with error prompt
+do_dr9x:
+	move.b #1,fCmdDone
+	rts
+do_dr_reg:	
+* a1 points to a null terminated message
+* a0 points to save register array
+	move.l a1,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD
+do_drd0:
+	cmp.b #True,fTxDone	* wait for string transmission done before returning
+	bne do_drd0		* OS swap task here
+	move.l (a0),d0
+	bsr reg2ascii		* convert d0 to ASCII equivalent
+	move.l #RegASCII,pStr	* RegASCII is global variable in system RAM
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD
+do_drd0a:
+	cmp.b #True,fTxDone	* wait for string transmission done before returning
+	bne do_drd0a		* OS swap task here	
+	rts
+	
+do_mm:	
+	and.l #$FFFFFFFE,cmdparam	* make sure address is even
+	move.l cmdparam,a0	* this is starting address to be modified
+	cmp.b #0,cCmdparam
+	beq do_mm8		* no parameter, exit with error prompt
+	cmp.b #2,cCmdparam	* one or two parameters
+	bgt do_mm8		* more than two parameters, exit with error prompt
+	move.b #0,bAnswer+13	* modify the bAnswer message string so not to print prompt
+	cmp.b #1,cCmdparam
+	beq do_mm3		* do memory modify submenu
+	move.w cmdparam+6,(a0)	* modify the address with word size data, 
+				* discard the upper word
+	move.w (a0),d0		* read back and display
+	move.l a0,d1
+	bsr compuAnswer
+	move.l #bAnswer,pStr	* send out the answer
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone	
+	clr.l d0		* signal regular prompt
+	clr.b exitCode		** normal exit
+	bra do_mm9x	
+do_mm8:
+	moveq.l #1,d0		* signal error prompt
+	move.b #1,exitCode	** exit with error prompt
+do_mm9x:	
+	bsr iBuffer		* restore the bAnswer buffer
+	bra do_mm9y
+do_mm3:
+* interactive session, period (.) to end session, minus (-) to go back, CR for next address
+	move.b #':',bAnswer+13	* add a colon to prompt for new value
+	move.b #0,bAnswer+14	* terminate string after colon
+do_mm4:
+	move.w (a0),d0		* read memory and display
+	move.l a0,d1		* d1 contains the address
+	bsr compuAnswer		* 
+	move.l #bAnswer,pStr	* send out the query
+	move.b #False,fTxDone
+	move.w #3,IMRD
+	clr.b fDoCmd		* clear command ready flag
+	clr.b cCmd		* clear the command buffer count
+	move.l #bCmdline,pCmdln
+	bsr wTxDone		* finish sending string
+	move.b #1,sInteractive	* set the mm command interactive session flag
+	move.l a0,mmaddress	* save the address for next interactive session
+	move.l #2,d0		* signal interactive session in progress
+	rts			** interactive session, return without clear the fCmdDone 
+do_mm9y:
+	move.b #1,fCmdDone	* flag the command is finished
+	rts			
+do_mr:
+	movem.l d0-d7/a0-a7,savd0	* capture current register values
+do_bp_mr:			* entry point for mr command in breakpoint handler
+				* register array is already saved
+	cmp.b #2,cCmdparam	* expect one or two parameters
+	bhi do_mr8
+	cmp.b #0,cCmdparam	* if no parameter, exit with error prompt
+	beq do_mr8
+	move.l cmdparam,d2	* get the parameter
+	cmp.l #$a0,d2		* $a0 <= parameter <= $a7
+	blo do_mr8
+	cmp.l #$a7,d2
+	bhi do_mr_dx		* check for $d0-$d7
+	sub.l #$a0,d2
+	move.l d2,d3
+	mulu.w #RegStrLen,d3	* compute string array address offset
+	lsl.l #2,d2		* compute register array offset
+	lea savA0,a0		* offset from address register 0
+	lea regA0(pc),a1	* array base is address register 0 string
+	bra do_mr2
+do_mr_dx:
+	cmp.l #$d0,d2		* $d0 <= parameter <= $d7
+	blo do_mr8		* exit with error prompt
+	cmp.l #$d7,d2
+	bhi do_mr8
+	sub.l #$d0,d2
+	move.l d2,d3
+	mulu.w #RegStrLen,d3	* compute string array address offset
+	lsl.l #2,d2		* compute register array offset
+	lea savD0,a0		* array base is the data register 0
+	lea regD0(pc),a1	* array base is the data register 0 string
+do_mr2:
+	adda.l d2,a0		* compute correct offset from base
+	adda.l d3,a1		* compute correct string to display
+	cmp.b #1,cCmdparam	* if one parameter, go to interactive session
+	beq do_mr3
+	move.l cmdparam+4,(a0)	* modified the specified register
+	bsr do_dr_reg
+	bra do_mr9
+do_mr3:
+* interactive session, period (.) to end session, minus (-) to go back, CR for next address
+	move.b #':',nullchar	* replace first null character with colon prompt
+do_mr4:
+	bsr do_dr_reg
+	clr.b fDoCmd		* clear command ready flag
+	clr.b cCmd		* clear the command buffer count
+	move.l #bCmdline,pCmdln
+	bsr wUserInput		* wait for fDoCmd flag
+	tst.b cCmd		* if just CR, examine/modify next register
+	beq do_mr7
+	cmp.b #'.',bCmdline	* period terminate the session
+	beq do_mr9i
+	cmp.b #'=',bCmdline	* = re-display the same register
+	beq do_mr4
+	cmp.b #' ',bCmdline	* no blank allow
+	beq do_mr8i
+	cmp.b #'-',bCmdline	* minus go back one register
+	bne do_mr5
+	cmp.l #savd0,a0		* make sure we are within the register array
+	beq do_mr4		* don't go back one register if already register d0
+	suba.l #4,a0
+	suba.l #RegStrLen,a1
+	bra do_mr4
+do_mr5:
+* cCmd may be 0 - 8.  If 0, advanced to next address, else write data to current
+* register and advnced to next address.  exit session with error prompt if illegal value	
+	cmp.b #8,cCmd		* no more than 8 characters should be entered
+	bgt do_mr8i
+	move.b cCmd,d3		* d3 is loop counter
+	ext.w d3
+	sub.w #1,d3		* this is the actual loop count
+	clr.l d2		* d2 contains the new value for register
+	move.l a1,a2		* save copy of a1
+	lea bCmdline,a1
+do_mr6:
+	move.b (a1)+,d0		* accumulate value one nibble at a time
+	bsr asc2hex
+	cmp.b #$FF,d0		* exit interactive session if illegal hex value
+	beq do_mr8i
+	lsl.l #4,d2
+	add.b d0,d2
+	dbra d3,do_mr6
+	move.l a2,a1		* restore original a1
+	move.l d2,(a0)		* write new value into current register
+do_mr7:
+	cmp.l #savpc,a0		* don't increment beyond pc register
+	beq do_mr4
+	adda.l #4,a0		* bump to next register array
+	adda.l #RegStrLen,a1	* bump to next message array
+	bra do_mr4
+do_mr8i:
+* Interactive command consumed in this session, don't carry into next command
+	clr.b fDoCmd		* clear command ready flag
+	clr.b cCmd		* clear the command buffer count
+	move.l #bCmdline,pCmdln	
+	bra do_mr8
+do_mr9i:
+* Interactive command consumed in this session, don't carry into next command
+	clr.b fDoCmd		* clear command ready flag
+	clr.b cCmd		* clear the command buffer count
+	move.l #bCmdline,pCmdln		
+do_mr9:
+	tst.b fdobkpt		* check for breakpoint in progress
+	bne do_mr9y		* skip over the save register array if 
+				* executing from breakpoint service routine
+	movem.l savd0,d0-d7/a0-a7	* copy save registers back to real registers
+do_mr9y:
+	move.b #0,nullchar	* restore the null terminator for normal use
+	clr.l d0
+	clr.b exitCode		** normal exit
+	bra do_mr9x
+do_mr8:
+	moveq.l #1,d0
+	move.b #1,exitCode	** exit with error prompt
+do_mr9x:
+	move.b #1,fCmdDone	* flag the command is finished
+	rts			
+do_go:
+* if no parameter, use the save register array
+	cmp.b #0,cCmdparam	* if no parameter, use the save register array
+	beq do_go6
+	cmp.b #2,cCmdparam	* 2 parameters means breakpoint on the 2nd parameter location
+	beq do_go2
+	cmp.b #1,cCmdparam	* 1 parameter is the address
+	bne do_go8
+do_go3:
+	and.l #$FFFFFFFE,cmdparam	* make sure address is even
+	move.l cmdparam,a0
+	jsr (a0)
+	bra do_go7
+do_go2:
+	tst.l bkptaddr			* check if valid breakpoint already exists
+	bne do_go8x
+	and.l #$FFFFFFFE,cmdparam+4	* make sure the breakpoint address is even
+	move.l cmdparam+4,bkptaddr	* save the breakpoint address
+	move.l cmdparam+4,a0
+	move.l (a0),bkptinstr		* save the instruction
+	move.w #$48FC,(a0)		* insert illegal instruction
+	cmp.w #$48FC,(a0)		* verify breakpoint inersertion successful
+	bne do_bp8x
+	bra do_go3	
+do_go6:
+	movem.l savd0,d0-d7/a0-a7	* use the save register array
+	move.l savpc,a0			* except a0
+	jsr (a0)
+do_go7:
+	move.l d0,savd0		* display returned value of d0
+	lea savd0,a0
+	lea procdonemsg(pc),a1
+	bsr do_dr_reg		* display process terminated message
+	move.l savd0,d0		* restore the returned value of d0
+	bra do_go9x
+do_go9:
+	clr.l d0
+	clr.b exitCode		** normal exit
+	bra do_mr9x
+do_go8x:
+	pea badgomsg(pc)	* print error message, breakpoint already in use
+	move.l (sp)+,pStr
+	move.b #3,IMRD		* enable chan a TxRDY/RxRDY interrupts
+	move.b #False,fTxDone
+	bsr wTxDone
+do_go8:
+	moveq.l #1,d0
+	move.b #1,exitCode	** exit with error prompt
+do_go9x:
+	move.b #1,fCmdDone	* flag the command is finished
+	rts
+do_bp:
+* breakpoint insert/display/clear
+* no parameter display the current breakpoint, one parameter swap out the word in specified
+*  address with illegal instruction.  bp 0 clear breakpoint
+	cmp.b #0,cCmdparam	* no parameter means display breakpoint
+	beq do_bp5
+	cmp.b #1,cCmdparam	
+	bne do_bp8
+	tst.l cmdparam		* if parameter is zero, restore breakpoint
+	beq do_bp3
+	and.l #$FFFFFFFE,cmdparam	* make sure address is even
+	move.l cmdparam,a0
+	move.l cmdparam,bkptaddr	* update the breakpoint address
+	move.w (a0),bkptinstr		* save the original instruction
+	move.w #$48FC,(a0)		* insert illegal instr to specified location
+	cmp.w #$48FC,(a0)		* verify insertion successful
+	bne do_bp8x
+	bra do_bp6			* display breakpoint
+do_bp3:
+	tst.l bkptaddr			* if no breakpoint found, display no breakpoint message
+	beq do_bp7
+	move.l bkptaddr,a0		* address of the original instruction
+	move.w bkptinstr,(a0)		* restore original instruction
+	lea bkptaddr,a0
+	lea bpremovemsg(pc),a1		* display the breakpoint removed message
+	bsr do_dr_reg
+	clr.l bkptaddr			* no breakpoint exists
+	bra do_bp9
+do_bp5:	
+	tst.l bkptaddr			* check if valid breakpoint exists
+	beq do_bp7
+do_bp6:
+	lea bkptaddr,a0
+	lea bkptmsg(pc),a1		* print display current breakpoint
+	bsr do_dr_reg			* a0 is pointed at the address of breakpoint	
+	bra do_bp9
+do_bp7:
+	pea nobpmsg(pc)			* display no breakpoint found message
+	move.l (sp)+,pStr
+	move.b #3,IMRD
+	move.b #False,fTxDone
+	bsr wTxDone	
+do_bp9:
+	clr.l d0
+	clr.b exitCode		** normal exit
+	bra do_mr9x
+do_bp8x:
+* unable to insert breakpoint
+	clr.l bkptaddr		* remove breakpoint
+	pea badbpmsg(pc)
+	move.l (sp)+,pStr
+	move.b #3,IMRD
+	move.b #False,fTxDone
+	bsr wTxDone
+do_bp8:
+	moveq.l #1,d0
+	move.b #1,exitCode	** exit with error prompt
+do_bp9x:
+	move.b #1,fCmdDone	* flag the command is finished
+	rts
+do_sw:
+* switch CS0 and CS1 assignment, RAM (CS1) base to $0 and alias at $200000, 
+* boot flash to $600000.  Restart the program	
+* Because of the boot ROM base address change, The return address for all nested exceptions
+* are no longer correct.  So the best thing is to reinitiate stack and jump right
+* after the BR/OR initialization
+*	cmp.l #$600400,$4
+	move.w $0,d0		* save before testing
+	move.w #$F0F0,$0	* can loc 0x0 be modified?
+	cmp.w #$F0F0,$0
+	bne do_sw1
+	move.w d0,$0		* restore original value
+	pea switchedmsg(pc)	* if switched already, put out msg and exit with error prompt
+	move.l (sp)+,pStr
+	move.b #False,fTxdone
+	move.w #3,IMRD
+**	bsr wTxDone
+	moveq.l #1,d0		* return with error prompt
+	move.b #1,exitCode	** exit with error prompt
+	move.b #1,fCmdDone
+	rts	
+do_sw1:	
+	pea switchmsg(pc)	* print out the switch message
+	move.l (sp)+,pStr
+	clr.b cCmd		* ready for next command
+	clr.b fDoCmd
+	move.l #bCmdline,pCmdln
+	move.b #False,fTxDone
+	move.w #3,IMRD		* enable tx/rx interrupt	
+	bsr wTxDone
+	lea sw_instr(pc),a1	* copy switch instructions to system RAM
+	lea $fff100,a0		* destination
+	move.w #9,d1		* one less the number of long words to move
+do_sw2:
+	move.l (a1)+,(a0)+	* copy source to destination
+	dbra d1,do_sw2
+* copy the vectors to RAM.  ROM base is now $600000, so $600000 are added to all vectors
+	lea $200004,a0		* destination is RAM
+	lea $4,a1		* source is boot flash, ignore the reset stack pointer
+	move.w #$FE,d1		* one less the number of long words to move
+do_sw3:
+	move.l (a1)+,d0
+	add.l #$600000,d0	* add $600000 to all vectors
+	move.l d0,(a0)+
+	dbra d1,do_sw3
+	move.b #1,fCmdDone	* flag the command is finished	
+	jmp $fff100		* will not return
+do_help:
+	pea helpmsg(pc)		* print out help message
+	move.l (sp)+,pStr
+	move.b #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts
+	move.b #False,fTxDone
+**	bsr wTxDone
+	clr.l d0
+	clr.b exitCode		** normal exit
+	move.b #1,fCmdDone	* flag the command is finished	
+	rts
+	
+mminteractive:
+* this is the interactive session for mm command
+	move.l mmaddress,a0	* restore address to be modified
+	tst.b cCmd		* if just CR, modify next address
+	beq mminteract1
+	cmp.b #'.',bCmdline	* period terminate the session
+	beq mminteract9
+	cmp.b #'=',bCmdline	* = re-display the same address
+	beq mminteract2
+	cmp.b #' ',bCmdline	* no blank allow
+	beq mminteract8
+	cmp.b #'-',bCmdline	* minus go back one word address
+	beq mminteract3
+* cCmd may be 0 - 4.  If 0, advanced to next address, else write data to current
+* memory and advnced to next address.  exit session with error prompt if illegal value	
+	cmp.b #4,cCmd
+	bgt mminteract8
+	move.b cCmd,d3		* d3 is loop count
+	ext.w d3		* get d3 ready for dbra operation
+	sub.w #1,d3		* the actual loop count is one less
+	clr.l d2		* d2 contains the new data value
+	lea bCmdline,a1
+mminteract6:
+	move.b (a1)+,d0		* accumulate value one nibble at a time
+	bsr asc2hex
+	cmp.b #$FF,d0		* exit session if illegal hex value
+	beq mminteract8
+	lsl.l #4,d2
+	add.b d0,d2
+	dbra d3,mminteract6
+	move.w d2,(a0)		* write new data value into current address
+mminteract1:	
+	add.l #2,a0		* next address location
+	bra mminteract2
+mminteract3:
+	sub.l #2,a0
+mminteract2:
+	move.w (a0),d0		* read memory and display
+	move.l a0,d1		* d1 contains the address
+	bsr compuAnswer		* 
+	move.l #bAnswer,pStr	* send out the query
+	move.b #False,fTxDone
+	move.w #3,IMRD
+	clr.b fDoCmd		* clear command ready flag
+	clr.b cCmd		* clear the command buffer count
+	move.l #bCmdline,pCmdln
+*	bsr wTxDone		* finish sending string
+*	move.b #1,sInteractive	* set the mm command interactive session flag
+	move.l a0,mmaddress	* save the address for next interactive session
+	move.l #2,d0		* signal interactive session in progress
+	bra mminteract9y
+mminteract8:
+	moveq.l #1,d0		* error prompt
+	move.b #1,exitCode	** exit with error prompt
+	bra mminteract9x
+mminteract9:
+	clr.l d0		* normal prompt
+	clr.b exitCode		** normal exit
+mminteract9x:
+	clr.b sInteractive	* interactive session is over
+	bsr iBuffer		* restore the bAnswer buffer content
+** mminteract9y:
+	move.b #1,fCmdDone	* flag the command is finished
+mminteract9y:			** return without setting the fCmdDone flag
+				** session not over
+* Interactive command consumed in this session, don't carry into next command
+	clr.b fDoCmd		* clear command ready flag
+	clr.b cCmd		* clear the command buffer count
+	move.l #bCmdline,pCmdln
+	rts
+	
+do_xt:
+* set or display real time clock, RTC72423.  xt shows time, xt yymmddhhmmss set time and
+* transmit time information over Xbee, if present.
+	tst.b cCmdparam		* check for parameter
+	bne do_xt2
+do_xt1:
+	lea rtctime,a0		* points to time storage
+	move.w #'20',(a0)+	* year is 20xx
+*	bset.b #0,$30005b	* set hold bit to 1
+*do_xt1a:
+*	btst.b #1,$30005b	* check busy, wait for it to clear
+*	bne do_xt1a
+	move.b $300057,d0	* read 2nd digit of year
+	and.b #$f,d0		* only lowest nibble is valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+
+	move.b $300055,d0	* read 1st digit of year
+	and.b #$f,d0		* only lowest nibble is valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+
+	move.b #'/',(a0)+	* pad a space separator
+	move.b $300053,d0	* read 2nd digit of month
+	and.b #$1,d0		* only lowest bit is valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+	
+	move.b $300051,d0	* read 1st digit of month
+	and.b #$f,d0		* only lowest nibble is valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+	
+	move.b #'/',(a0)+	* pad a space separator
+	move.b $30004f,d0	* read 2nd digit of day
+	and.b #$3,d0		* only lowest 2 bits are valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+	
+	move.b $30004d,d0	* read 1st digit of day
+	and.b #$f,d0		* only lowest nibble is valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+
+	move.b #' ',(a0)+	* pad a space separator
+	move.b $30004b,d0	* read 2nd digit of hour
+	and.b #$3,d0		* only lowest 2 bit are valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+
+	move.b $300049,d0	* read 1st digit of hour
+	and.b #$f,d0		* only lowest nibble is valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+
+	move.b #':',(a0)+	* pad a space separator
+	move.b $300047,d0	* read 2nd digit of minute
+	and.b #$7,d0		* only lowest 3 bits are valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+
+	move.b $300045,d0	* read 1st digit of minute
+	and.b #$f,d0		* only lowest nibble is valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+
+	move.b #':',(a0)+	* pad a space separator
+	move.b $300043,d0	* read 2nd digit of second
+	and.b #$7,d0		* only lowest 3 bits are valid
+	add.b #$30,d0		* convert to ascii
+	move.b d0,(a0)+
+	move.b $300041,d0	* read 1st digit of second
+	and.b #$f,d0		* only lowest nibble is valid
+	add.b #$30,d0		* convert to ascii
+*	bclr.b #0,$30005b	* clear the hold bit
+	move.b d0,(a0)+
+	clr.b (a0)		* zero terminate the string
+	pea xtshowmsg(pc)	* print the time message
+	move.l (sp)+,pStr
+	move.b #False,fTxdone
+	move.w #3,IMRD
+	bsr wTxDone
+	move.l #rtctime,pStr
+	move.b #False,fTxdone
+	move.w #3,IMRD
+*	bsr wTxDone
+	bra do_xt9	
+do_xt2:
+	cmp.b #2,cCmdparam	* should only be two 6-character parameters
+	bne do_xt8		* returns with error prompt
+* format for global timer set Xbee command is:
+* 0xF0,cmdparam, cmdparam+4,checksum
+* find next available empty transmit BD in scc3 and copy the global timer set value to it
+* If next available Tx BD can't be found, exit with error because operation is time critical
+* The next buffer scc3 will use is contain in $FFF693 as offset from $FFF600
+	btst.b #0,$300060	* look for data bit 8@$300060.  If clear, transmit time on Xbee
+	bne do_xt1		* else print out the time values entered
+	move.l #$FFF600,d0
+	add.b $FFF693,d0	* forming the address of the next TxBD	
+	move.l d0,a2
+	btst.b #7,(a2)		* Is transmit buffer available?
+	bne do_xt8	
+	move.l 4(a2),a0		* get the buffer address associated with the availabe TxBD				
+	move.b #$F0,d4		* prepare for checksum calculation
+	move.b #$F0,(a0)+	* start copying Xbee command to buffer, accumulate checksum
+	lea cmdparam,a1		* move yymmdd hhmmss into tx BD and accumulate checksum
+	move.w #7,d3
+usetx1a:
+	move.b (a1),(a0)+
+	add.b (a1)+,d4
+	dbra d3,usetx1a
+	not d4			* this is the checksum
+	move.b d4,(a0)+		* transfer finished
+
+	move.w #10,2(a2)	* transmit 10 bytes
+	bset.b #7,(a2)		* mark Tx BD for transmission
+	
+* expected value in cmdparam is 0x00yymmdd, in cmdparam+4 is 0x00hhmmss
+	move.b cmdparam+1,d0	* this contains year data
+	move.b d0,$300055	* write out the 1st digit of year, 2nd nibble is ignored
+	lsr.b #4,d0		* get the 2nd digit of year
+	move.b d0,$300057	* write out the 2nd digit of year
+	move.b cmdparam+2,d0	* this contains month data
+	move.b d0,$300051	* write out the 1st digit of month, 2nd nibble is ignored
+	lsr.b #4,d0		* get the 2nd digit of month
+	move.b d0,$300053	* write out the 2nd digit of month
+	move.b cmdparam+3,d0	* this contains day data
+	move.b d0,$30004d	* write out the 1st digit of day, 2nd nibble is ignored
+	lsr.b #4,d0		* get the 2nd digit of day
+	move.b d0,$30004f	* write out the 2nd digit of day
+	move.b cmdparam+5,d0	* this contains hour data
+	move.b d0,$300049	* write out the 1st digit of hour, 2nd nibble is ignored
+	lsr.b #4,d0		* get the 2nd digit of hour
+	move.b d0,$30004b	* write out the 2nd digit of hour
+	move.b cmdparam+6,d0	* this contains minute data
+	move.b d0,$300045	* write out the 1st digit of minute, 2nd nibble is ignored
+	lsr.b #4,d0		* get the 2nd digit of minute
+	move.b d0,$300047	* write out the 2nd digit of minute
+	move.b cmdparam+7,d0	* this contains second data
+	move.b d0,$300041	* write out the 1st digit of second, 2nd nibble is ignored
+	lsr.b #4,d0		* get the 2nd digit of second
+	move.b d0,$300043	* write out the 2nd digit of second
+	bra do_xt1		* print out the time value
+do_xt8:
+	move.l #1,d0		* error prompt
+	move.b #1,exitCode	** exit with error prompt
+	bra do_xt9a
+do_xt9:
+	clr.l d0
+	clr.b exitCode		** exit normally
+do_xt9a:
+	move.b #1,fCmdDone	
+	rts
+do_xo:
+* enable all station to report every 10-second
+* command format is 0xF1, checksum is 0x0E
+	tst.b cCmdparam		* do not expect any parameter
+	bne do_xt8
+	move.b #1,fxbeeon	* set the local 10-sec reporting flag
+	btst.b #0,$300060	* look for Xbee installed on bit8@$300060
+	bne do_xt8		* error, exit with error prompt
+	move.l #$FFF600,d0
+	add.b $FFF693,d0	* forming the address of the next TxBD	
+	move.l d0,a2
+	btst.b #7,(a2)		* Is transmit buffer available?
+	bne do_xt8
+	move.l 4(a2),a0		* get the buffer address associated with the availabe TxBD
+	move.b #$F1,(a0)+	* start copying Xbee command to buffer, accumulate checksum
+	move.b #$E,(a0)+	* checksum
+	move.w #2,2(a2)		* transmit 2 bytes
+	bset.b #7,(a2)		* mark Tx BD for transmission
+do_xo7:
+	pea xomsg(pc)		* PC relative addressing
+	move.l (sp)+,pStr
+	move.b #3,IMRD		* enable chan A TxRdy/RxRdy interrupts
+	move.b #False,fTxDone
+*	bsr wTxDone
+	clr.l d0
+	clr.b exitCode		** normal exit
+	move.b #1,fCmdDone	* flag the command is finished
+	rts
+do_xx:
+* turn off all station 10-sec reporting 
+* command format is 0xF2, checksum is 0x0D
+	tst.b cCmdparam		* do not expect any parameter
+	bne do_xt8
+	clr.b fxbeeon		* clear the local flag
+	btst.b #0,$300060	* look for Xbee installed on bit8@$300060
+	bne do_xt8		* error, exit with error prompt
+	move.l #$FFF600,d0
+	add.b $FFF693,d0	* forming the address of the next TxBD	
+	move.l d0,a2
+	btst.b #7,(a2)		* Is transmit buffer available?
+	bne do_xt8
+	move.l 4(a2),a0		* get the buffer address associated with the availabe TxBD
+	move.b #$F2,(a0)+	* start copying Xbee command to buffer, accumulate checksum
+	move.b #$D,(a0)+	* checksum
+	move.w #2,2(a2)		* transmit 2 bytes
+	bset.b #7,(a2)		* mark Tx BD for transmission
+do_xx7:
+	pea xxmsg(pc)		* PC relative addressing
+	move.l (sp)+,pStr
+	move.b #3,IMRD		* enable chan A TxRdy/RxRdy interrupts
+	move.b #False,fTxDone
+*	bsr wTxDone
+	clr.l d0
+	clr.b exitCode		** normal exit
+	move.b #1,fCmdDone	* flag the command is finished
+	rts
+do_xe:
+* erase the data log.  Data is not erase, but the pointer is moved back to 0x2c0000
+* if no parameter, erase the local adc mpu board
+* command format is 0xF3, station #, checksum.  
+	tst.b cCmdparam
+	beq do_xe3		* no parameter, just the local board
+	cmp.b #1,cCmdparam	* should only have 1 parameter
+	bne do_xt8		* error, exit with error prompt
+	btst.b #0,$300060	* look for Xbee installed on bit8@$300060
+	bne do_xt8		* error, exit with error prompt
+	move.l #$FFF600,d0
+	add.b $FFF693,d0	* forming the address of the next TxBD	
+	move.l d0,a2
+	btst.b #7,(a2)		* Is transmit buffer available?
+	bne do_xt8
+	move.l 4(a2),a0		* get the buffer address associated with the availabe TxBD
+	move.b #$f3,(a0)+	* start copying Xbee command to buffer, accumulate checksum
+	move.b #$f3,d4		* prepare for checksum
+	add.b cmdparam+3,d4	* station number
+	move.b cmdparam+3,(a0)+
+	not.b d4		* forming the checksum
+	move.b d4,(a0)+
+	move.w #3,2(a2)		* transmit 3 bytes
+	bset.b #7,(a2)		* mark Tx BD for transmission
+	bra do_xe7
+do_xe3:
+* just set the plogger back to 0x2c0000
+	move.l #$2c0000,plogger
+do_xe7:
+	pea xemsg(pc)
+	move.l (sp)+,pStr	* sending out "erase logged data" message
+	move.b #3,IMRD		* enable chan A TxRdy/RxRdy interrupts
+	move.b #False,fTxDone
+*	bsr wTxDone
+	clr.l d0
+	clr.b exitCode		** normal exit
+	move.b #1,fCmdDone	* flag the command is finished
+	rts
+	
+do_xd:
+* command may have one parameter value from 0-9 which is the station number or no parameter
+* when station is specified, it send out 0xF5, station #, action (ff=on, 0=off), checksum
+* sInteractive is set to 4, downtimer is set to 0.5 second, pxdlogger is pointed to $2c0000
+* command will complete in the interactive session.
+* if xd has no parameter, then it is for displaying the data stored in local logger.
+* the sInteractive is set to 5, pxdlogger set to $2c0000.
+	tst.b cCmdparam		* if no parameter, display local data log
+	beq do_xd5
+	cmp.b #1,cCmdparam	* should only have 1 parameter, value 0-9
+	bne do_xt8		* error prompt
+	cmp.l #9,cmdparam	* no bigger than 9
+	bhi do_xt8
+	move.w #50,downtimer	* timeout value of 500ms
+	clr.w cxbeeresp		* clear the number of response packet received
+*	move.l #$2c0000,pxdlogger	* initialize the pointer for log data
+* use existing plogger to store the incoming data
+	move.b #4,sInteractive	* Interactive session ID=4	
+	move.l #$FFF600,d0
+	add.b $FFF693,d0	* forming the address of the next TxBD	
+	move.l d0,a2
+	btst.b #7,(a2)		* Is transmit buffer available?
+	bne do_xt8
+	move.l 4(a2),a0		* get the buffer address associated with the availabe TxBD
+	move.b #$f5,(a0)+	* start copying Xbee command to buffer, accumulate checksum
+	move.b #$f5,d4		* prepare for checksum	
+	add.b cmdparam+3,d4	* station number
+	move.b cmdparam+3,(a0)+
+	move.b cmdparam+3,xdstation	* save the station number in case of xd cancellation
+	move.b #$ff,(a0)+	* action of 0xff is turning on data dumping
+	add.b #$ff,d4		* accumulating checksum	
+	not.b d4		* forming the checksum
+	move.b d4,(a0)+	
+	move.w #4,2(a2)		* transmit 4 bytes
+	bset.b #7,(a2)		* mark Tx BD for transmission
+	clr.b freceivexdresp	* this flag determine timeout due to remote station not
+				* responding or remote station send all data
+	move.l #2,d0		* signal interactive session in progress
+do_xd9:	
+**	move.b #1,fCmdDone	** session in progress, do not set fCmdDone 
+	rts	
+do_xd5:
+* no parameter, display the local data log
+	move.b #5,sInteractive	* interactive session ID=5
+	move.l #$2c0000,pxdlogger	* initialize the pointer for data log
+	move.l #2,d0		* signal interactive session in progress
+	bra do_xd9
+	
+xdinteractive:	
+* when xbee response packet is received, reset timeout value, copy response to local data log
+* put a period (.) to console for every 10 packets received. put out ? for corrupted data
+* Response from the remote xbee station.	
+* fxbeeresp is set when this routine is executing, data is in bxbeeresp
+* station #, $f5,yymmddhhmmss, temperature (raw), chksum
+* bxbeeresp = station #
+* bxbeeresp+1 = 0xF5
+* bxbeeresp+2 = yymmddhh
+* bxbeeresp+6 = mmss
+* bxbeeresp+8 = temperature
+* bxbeeresp+10 = checksum
+	clr.b d0	* prepare checksum
+	move.w #9,d1	* 10 bytes of incoming data + checksum
+	lea bxbeeresp,a1
+xdinteract2:
+	add.b (a1)+,d0		* accumulate checksum
+	dbra d1,xdinteract2	
+	not.b d0		* this is the receive checksum
+	cmp.b (a1),d0		* compare checksum
+	bne xdinteract3b	* put out a question mark on console
+	cmp.b #$f5,bxbeeresp+1	* verify this is response to xd command
+	bne xdinteract3b	* put out a question mark on console
+	move.w #50,downtimer	* reset the timeout value to 500ms
+	move.l plogger,a0	* where to store the incoming data
+	lea bxbeeresp+2,a1	* source of the data
+	move.l (a1)+,(a0)+	* move 8 bytes of data
+	move.l (a1)+,(a0)+	
+	move.l a0,plogger	* store updated data log pointer
+	move.b #1,freceivexdresp	* flag one or more responses received from remote
+	add.w #1,cxbeeresp	* put out a period (.) for every 10 packets
+	cmp.w #10,cxbeeresp
+	bne xdinteract3
+	clr.w cxbeeresp
+	move.b #'.',THRA+1	* only one character, no need to check for transmit ready
+	bra xdinteract3
+xdinteract3b:
+	move.b #'?',THRA+1	* only one character, no need to check for transmit ready
+xdinteract3:
+	clr.b fxbeeresp		* the response packet is processed
+	move.l #2,d0		* signal interactive session in progress
+				* do not set fCmdDone
+	rts
+	
+xdinteract8tu:
+* timeout, send out appropriate reason for timing out, clear sInteractive, 
+	tst.b freceivexdresp
+	bne xdinteract8tu1
+	pea xserrmsg(pc)	* remote station not responding, timeout
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+*	bsr wTxDone
+	bra xdinteract8tu2
+xdinteract8tu1
+	pea xd5amsg(pc)		* all data received
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+*	bsr wTxDone
+xdinteract8tu2:
+	clr.b sInteractive
+	clr.l d0
+	clr.b exitCode		** normal exit
+	move.b #1,fCmdDone	** command finished
+	rts
+xdinteract8cr:
+* any console input followed by carriage return will cancel the xd command
+* xd cancel command is 0xF5, station number, action=0, checksum
+* station number is previously saved in xdstation
+	pea xdcancelmsg(pc)	* command cancelled by user
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+*	bsr wTxDone	
+	move.l #$FFF600,d0
+	add.b $FFF693,d0	* forming the address of the next TxBD	
+	move.l d0,a2
+	btst.b #7,(a2)		* Is transmit buffer available?
+	bne do_xt8
+	move.l 4(a2),a0		* get the buffer address associated with the availabe TxBD
+	move.b #$f5,(a0)+	* start copying Xbee command to buffer, accumulate checksum
+	move.b #$f5,d4		* prepare for checksum	
+	add.b xdstation,d4	* station number saved when xd cmd originally invoked
+	move.b xdstation,(a0)+
+	move.b #0,(a0)+		* action of 0xff is turning on data dumping
+*	add.b #0,d4		* accumulating checksum	
+	not.b d4		* forming the checksum
+	move.b d4,(a0)+	
+	move.w #4,2(a2)		* transmit 4 bytes
+	bset.b #7,(a2)		* mark Tx BD for transmission	
+	clr.b sInteractive
+	clr.w downtimer	
+	clr.b fxbeeresp		* mark whatever response packet received as invalid
+	clr.l d0
+	clr.b exitCode		** normal exit
+	move.b #1,fCmdDone	** command finished
+	rts
+xdinteractive5:
+* pxdlogger point to current set of temperature data, format it to display on console
+	pea xd5msg(pc)		* time label
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone	
+	move.l pxdlogger,a0	* a0 points to current set of temperature data
+	move.l (a0)+,rtctimebcd	* prepare for time2string subroutine which convert
+	move.w (a0)+,rtctimebcd+4	* 6 packed bcd digits in rtctimebcd to string
+	bsr time2string
+
+	move.l #rtctime,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone		
+	pea xs3msg(pc)		* temperature label
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone	
+	move.w (a0)+,d1		* get the raw temperature data
+	move.l a0,pxdlogger	* save the updated value of pxdlogger	
+	bsr c2f
+	lea btempnow,a0		* set up the temperature buffer for ascii data
+	move.w #6,d4		* fill out the field with blank
+blankfill5:
+	move.b #' ',(a0)+
+	dbra d4,blankfill5
+	move.b #0,(a0)		* null terminated 
+	lea btempnow,a0		
+	clr.l d0
+	move.w d1,d0		* print the integer portion
+	bsr hex2dec		* convert hex in d0 to decimal in buffer pointed by a0
+	move.b #'.',(a0)+	* print decimal point
+	bsr hexf2bcdf		* print the fraction
+	move.l #btempnow,pStr	* string buffer is in RAM, so no PC-relative addressing
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone	
+	move.l #2,d0		* signal interactive session in progress
+	rts
+xdinteract5dn:
+xdinteract5cr:
+	clr.b sInteractive
+	clr.l d0
+	clr.b exitCode		** normal exit
+	move.b #1,fCmdDone	** command finished
+	rts
+	
+do_xs:
+* display status of station #.  If no station is specified, then it is the local adc mpu
+* command format is 0xF4, station #, checksum.
+* data displayed are: yymmddhhmmss, station #, temperature, error count and data logger
+* this is an interactive session.  Session number is 3
+	tst.b cCmdparam
+	beq do_xs6		* no parameter, just display the local adc mpu status
+	cmp.b #1,cCmdparam	* should only have 1 parameter
+	bne do_xt8
+	btst.b #0,$300060	* look for Xbee installed on bit8@$300060
+	bne do_xt8		* error, exit with error prompt
+	move.l #$FFF600,d0
+	add.b $FFF693,d0	* forming the address of the next TxBD	
+	move.l d0,a2
+	btst.b #7,(a2)		* Is transmit buffer available?
+	bne do_xt8
+	move.l 4(a2),a0		* get the buffer address associated with the availabe TxBD
+	move.b #$f4,(a0)+	* start copying Xbee command to buffer, accumulate checksum
+	move.b #$f4,d4		* prepare for checksum	
+	add.b cmdparam+3,d4	* station number
+	move.b cmdparam+3,(a0)+
+	not.b d4		* forming the checksum
+	move.b d4,(a0)+
+	move.w #3,2(a2)		* transmit 3 bytes
+	bset.b #7,(a2)		* mark Tx BD for transmission
+	move.b #3,sInteractive	* mark this as interactive and return to here to finish
+	move.w #50,downtimer	* maximum of 1/2 second wait for response
+	move.l #2,d0		* signal interactive session in progress
+	bra do_xs9n
+do_xs9:
+	move.b #1,fCmdDone	
+do_xs9n:			** interactive session in progress, 
+	rts
+do_xs6:
+* local station status
+	pea xs1msg(pc)		* put status message 1, label for station number
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone	
+	move.b whoami,d0	* station number
+	cmp.b #9,d0
+	bgt do_xs6b
+	add.b #$30,d0		* convert to ascii
+	bra do_xs6a
+do_xs6b:
+	add.b #$37,d0		* value A-F
+do_xs6a	
+	move.b d0,THRA+1	* only transmit one character so no need to check status
+	pea xs2msg(pc)		* put out status message 2, label for time
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone
+	bsr showymdhms		* read the time and put it in a string in RAM
+	move.l #bymdhms,pStr	* string buffer is in RAM, so no PC-relative addressing
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone		
+	pea xs3msg(pc)		* put status message 3, label for temperature
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone		
+	move.w tempnow,d1	* get the latest temperature reading
+	bsr c2f
+	lea btempnow,a0		* set up the temperature buffer for ascii data
+	move.w #6,d4		* fill out the field with blank
+blankfill:
+	move.b #' ',(a0)+
+	dbra d4,blankfill
+	move.b #0,(a0)		* null terminated 
+	lea btempnow,a0		
+	clr.l d0
+	move.w d1,d0		* print the integer portion
+	bsr hex2dec		* convert hex in d0 to decimal in buffer pointed by a0
+	move.b #'.',(a0)+	* print decimal point
+	bsr hexf2bcdf		* print the fraction
+	move.l #btempnow,pStr	* string buffer is in RAM, so no PC-relative addressing
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone	
+	pea xs4msg(pc)		* put status message 4, label for error count
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone		
+	move.l cxbeeerr,d0	* get the error count
+	bsr txregd0		* transmit the content of d0 register
+	pea xs5msg(pc)		* put status message 5, label for data logger pointer
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone			
+	move.l plogger,d0
+	bsr txregd0
+	clr.b exitCode		* normal exit
+	bra do_xs9
+
+xsinteractive:
+* Response from the remote xbee station.  fxbeeresp is the response flag	
+* terminate the interactive session if remote station did not respond within 1/2 seconds
+* fxbeeresp is already set when this routine is executing, data is in bxbeeresp
+* station #, $f4,yymmddhhmmss, temperature (raw), error count, data logger pointer, chksum
+* bxbeeresp = station #
+* bxbeeresp+1 = 0xF4
+* bxbeeresp+2 = yymmddhh
+* bxbeeresp+6 = mmss
+* bxbeeresp+8 = temperature
+* bxbeeresp+10 = error count
+* bxbeeresp+14 = data logger pointer
+
+	clr.b d0		* verify checksum
+	lea bxbeeresp,a0
+	move.w #17,d2		* expect 19 bytes of data, last byte is checksum
+xschksum:
+	add.b (a0)+,d0		* accumulate checksum
+	dbra d2,xschksum
+	not.b d0		* checksum of the received data
+	cmp.b (a0),d0		* compare the checksum
+	bne xsinteract8a	
+	pea xs1msg(pc)		* put status message 1, label for station number
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone	
+	move.b bxbeeresp,d0	* station number
+	cmp.b #9,d0
+	bgt xsinteract6b
+	add.b #$30,d0		* convert to ascii
+	bra xsinteract6a
+xsinteract6b:
+	add.b #$37,d0		* value A-F
+xsinteract6a	
+	move.b d0,THRA+1	* only transmit one character so no need to check status
+	pea xs2msg(pc)		* put out status message 2, label for time
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone
+	move.l bxbeeresp+2,rtctimebcd	* move yymmddhh in packed bcd from response buffer
+	move.w bxbeeresp+6,rtctimebcd+4	* move mmss in packed bcd from response buffer
+	bsr time2string		* convert packed bcd time to null terminated string
+	move.l #rtctime,pStr	* string buffer is in RAM, so no PC-relative addressing
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone		
+	pea xs3msg(pc)		* put status message 3, label for temperature
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone		
+	move.w bxbeeresp+8,d1	* get raw temperature from the response buffer
+	bsr c2f
+	lea btempnow,a0		* set up the temperature buffer for ascii data
+	move.w #6,d4		* fill out the field with blank
+blankfill1:
+	move.b #' ',(a0)+
+	dbra d4,blankfill1
+	move.b #0,(a0)		* null terminated 
+	lea btempnow,a0		
+	clr.l d0
+	move.w d1,d0		* print the integer portion
+	bsr hex2dec		* convert hex in d0 to decimal in buffer pointed by a0
+	move.b #'.',(a0)+	* print decimal point
+	bsr hexf2bcdf		* print the fraction
+	move.l #btempnow,pStr	* string buffer is in RAM, so no PC-relative addressing
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone	
+	pea xs4msg(pc)		* put status message 4, label for error count
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone		
+	move.l bxbeeresp+10,d0	* get the error count from the response buffer
+	bsr txregd0		* transmit the content of d0 register
+	pea xs5msg(pc)		* put status message 5, label for data logger pointer
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone			
+	move.l bxbeeresp+14,d0
+	bsr txregd0
+	bra xsinteract9
+
+xsinteract8a:
+	pea xserr1msg(pc)	* corrupted communication error
+	bra xsinteract8b
+
+	
+xsinteract8:
+	pea xserrmsg(pc)	* no response from remote station error
+xsinteract8b:
+	move.l (sp)+,pStr
+	move.b #False,fTxDone	* start transmission
+	move.w #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts	
+	bsr wTxDone
+xsinteract9:
+	clr.b sInteractive	* exit interactive session
+	clr.l d0
+	clr.b exitCode		** normal exit
+	clr.b fxbeeresp		* clear the flag associated with xbee response
+	move.b #1,fCmdDone	
+	rts
+
+do_cp:
+* copy specified number of data (in byte) from source address to destination address
+* verify copy successful or not and returns appropriate prompt
+do_du:	
+* consolidate waiting for string transmission done here to facilitate OS later
+	clr.b exitCode
+	move.b #1,fCmdDone
+	rts
+wTxDone:
+	cmp.b #True,fTxDone	* wait for string transmission done before returning
+	bne wTxDone		* OS swap task here
+	rts
+wUserInput:
+	tst.b fDoCmd		* wait for user input
+	beq wUserInput		* OS swap task here
+	rts
+signon	dc.b $a,$d,'AMBug v1.18 1/4/2017',$a,$d,'type "he" for help',$a,$d,'> ',0
+prompt 	dc.b $a,$d,'> ',0
+qprompt	dc.b $a,$d,'?> ',0
+zmemmsg	dc.b $a,$d,'register memory cleared',$a,$d,'> ',0
+berrmsg	dc.b $a,$d,'Bus Error!',$a,$d,'Faulted address is: ',0
+illegalmsg dc.b $a,$d,'Illegal instruction at: ',0
+pcmsg	dc.b $a,$d,'Program counter is: ',0
+addrerrmsg dc.b $a,$d,'Address Error!',$a,$d,'Faulted address is: ',0
+badgomsg dc.b $a,$d,'Breakpoint already in use, unable to execute go to breakpoint',0
+runSrecord dc.b $a,$d,'Valid S records received, executing from starting address',0
+rundoneSR dc.b $a,$d,'S record execution completed',0
+procdonemsg dc.b $a,$d,'Process completed.  Reg D0 returns: ',0
+helpmsg dc.b $a,$d,'Commands are in lower case, <>optional, []mandatory'
+	dc.b $a,$d,'dm [address] <count>'
+	dc.b $a,$d,'dr <a|d|a0-a7|d0-d7>  Display all registers if no parameter'
+	dc.b $a,$d,'mm [address] <value>  If only address entered, a submenu will follow:'
+	dc.b $a,$d,'      . terminates submenu session',$a,$d,'      - go back one word address'
+	dc.b $a,$d,'      = display current address again'
+	dc.b $a,$d,'      [value] modify current address and display next address'
+	dc.b $a,$d,'      CR not modify current address but display next address'
+	dc.b $a,$d,'mr [a0-a7|d0-d7] <value>  If only register entered, a submenu will follow:'
+	dc.b $a,$d,'      . terminates submenu session',$a,$d,'      - go back one register'
+	dc.b $a,$d,'      = display current register again'
+	dc.b $a,$d,'      [value] modify current register and display next register'
+	dc.b $a,$d,'      CR not modify current register but display next register'
+	dc.b $a,$d,'go <from_addr> <to_addr> If no address specified, use save register values'
+	dc.b $a,$d,'bp <addr>  If no address specified, display current break point'
+	dc.b $a,$d,'      special case: bp 0 removes breakpoint'
+	dc.b $a,$d,'sw  switch CS0 and CS1, RAM base to $0 alias at $200000, ROM base to $600000'
+	dc.b $a,$d,'cp [src] [dst] [byte count]  copy specified number of data'
+	dc.b $a,$d,'      from source to destination'
+	dc.b $a,$d,'du [address] [word count] dump specified number of words'
+	dc.b $a,$d,'xt <yymmdd hhmmss> display or set timer (RTC72423).'
+	dc.b $a,$d,'    Transmit global time via Xbee'
+	dc.b $a,$d,'xo  turn on all Xbee stations.  Each station will transmit every 10 seconds'
+	dc.b $a,$d,'xx  turn off all Xbee stations, only apply to the 10-seconds transmission'
+	dc.b $a,$d,'xe <0-9> erase data in a station data logger or erase local station logger'
+	dc.b $a,$d,'xd <0-9> dump data in a station logger, or dump local station log'
+	dc.b $a,$d,'xs <0-9> status of a station, or status of the local station',0
+
+bphelpmsg dc.b $a,$d,'dm [address] <count>'
+	dc.b $a,$d,'dr <a|d|a0-a7|d0-d7>  Display all registers if no parameter'
+	dc.b $a,$d,'mm [address] <value>  If only address entered, a submenu will follow:'
+	dc.b $a,$d,'      . terminates submenu session',$a,$d,'      - go back one word address'
+	dc.b $a,$d,'      = display current address again'
+	dc.b $a,$d,'      [value] modify current address and display next address'
+	dc.b $a,$d,'      CR not modify current address but display next address'
+	dc.b $a,$d,'mr [a0-a7|d0-d7] <value>  If only register entered, a submenu will follow:'
+	dc.b $a,$d,'      . terminates submenu session',$a,$d,'      - go back one register'
+	dc.b $a,$d,'      = display current register again'
+	dc.b $a,$d,'      [value] modify current register and display next register'
+	dc.b $a,$d,'      CR not modify current register but display next register'
+	dc.b $a,$d,'gt <addr>  Set a breakpoint at specified address and resume program execution'
+	dc.b $a,$d,'      if no address specified, resume normal program execution'
+	dc.b $a,$d,'bp <addr>  If no address specified, display current break point'
+	dc.b $a,$d,'      special case: bp 0 removes breakpoint'
+	dc.b $a,$d,'tr <count>  Trace instruction execution <count> times'
+	dc.b $a,$d,'      if no parameter specified, trace one instruction'
+	dc.b $a,$d,'vb  Toggle verbose mode on or off'
+	dc.b $a,$d,'[carriage return] trace one instruction',0
+	
+q_no_cr	dc.b '?',0
+bpprompt dc.b $a,$d,'BP> ',0	* prompt used in breakpoint session
+bpqprompt dc.b $a,$d,'BP?> ',0
+bppromptnc dc.b ' BP>',0	* prompt without carriage return.
+nobpmsg	dc.b $a,$d,'No breakpoint specified',0
+badbpmsg dc.b $a,$d,'Unable to insert breakpoint',0
+bkptmsg dc.b $a,$d,'Breakpoint at: ',0
+bpremovemsg dc.b $a,$d,'Breakpoint removed from: ',0
+tracemsg dc.b $a,$d,'Trace --> Next instr:',0
+tracepcmsg dc.b ' at addr:',0
+tracestmsg dc.b ' current Status:',0
+verbosemsg dc.b $a,$d,'Verbose mode is On',0
+simplemsg dc.b $a,$d,'Verbose mode is Off',0
+switchedmsg dc.b $a,$d,'Already switched, boot flash is currently at $600000',0
+switchmsg dc.b $a,$d,'Switch RAM to $0 and alias at $200000, Boot flash to $600000',0
+	align 1
+sw_instr dc.w $33FC,$3800,$00FF,$F836		* move.w #$3800,$FFF836
+				* OR1, 1 wait, R/W, 4096K space aliased in $0 and $200000
+	dc.w $33FC,$0001,$00FF,$F834		* move.w #$0001,$FFF834
+				* BR1, $000000, CS1, RAM
+	dc.w $33FC,$CC01,$00FF,$F830 	* move.w #$CC01,$FFF830					
+				* BR0, $600000, CS0 Flash
+* Because of the boot ROM base address change, The return address for all nested exceptions
+* are no longer correct.  So the best thing is to reinitiate stack and jump right
+* after the BR/OR initialization
+	dc.w $46FC,$2700,$4FF9,$2F,$FFC,$4EF9,$60,$0450	
+		* move.w #$2700,sr        * mask off all interrupts
+		* lea $2F0FFC,sp          * reset the stack
+		* jmp $600450             * jump around the chipselect 0/1 initialization				
+regD0	dc.b $a,$d,'Register D0: ',0
+regD1	dc.b $a,$d,'Register D1: ',0
+regD2	dc.b $a,$d,'Register D2: ',0
+regD3	dc.b $a,$d,'Register D3: ',0
+regD4	dc.b $a,$d,'Register D4: ',0
+regD5	dc.b $a,$d,'Register D5: ',0
+regD6	dc.b $a,$d,'Register D6: ',0
+regD7	dc.b $a,$d,'Register D7: ',0
+regA0	dc.b $a,$d,'Register A0: ',0	
+regA1	dc.b $a,$d,'Register A1: ',0
+regA2	dc.b $a,$d,'Register A2: ',0
+regA3	dc.b $a,$d,'Register A3: ',0
+regA4	dc.b $a,$d,'Register A4: ',0
+regA5	dc.b $a,$d,'Register A5: ',0
+regA6	dc.b $a,$d,'Register A6: ',0
+regA7	dc.b $a,$d,'Register A7: ',0
+regPC	dc.b $a,$d,'Program Counter (for "go" command use only): ',0	*PC had different length
+regD0short dc.b $a,$d,'D0: ',0
+regD1short dc.b '  D1: ',0
+regD2short dc.b '  D2: ',0
+regD3short dc.b '  D3: ',0
+regD4short dc.b $a,$d,'D4: ',0
+regD5short dc.b '  D5: ',0
+regD6short dc.b '  D6: ',0
+regD7short dc.b '  D7: ',0
+regA0short dc.b $a,$d,'A0: ',0
+regA1short dc.b '  A1: ',0
+regA2short dc.b '  A2: ',0
+regA3short dc.b '  A3: ',0
+regA4short dc.b $a,$d,'A4: ',0
+regA5short dc.b '  A5: ',0
+regA6short dc.b '  A6: ',0
+regA7short dc.b '  A7: ',0
+regstrlen equ regA7-regA6	* compute the length of each string
+xtshowmsg dc.b $a,$d,' time in yyyy/mm/dd hh:mm:ss format: ',0
+xomsg	dc.b $a,$d,'All Xbee stations will report every 10 second',0
+xxmsg	dc.b $a,$d,'All Xbee stations will not report unless commanded to do so',0
+xemsg	dc.b $a,$d,'Erase logged data',0
+xs1msg	dc.b $a,$d,'station ',0
+xs2msg 	dc.b ' time:',0
+xs3msg	dc.b '  temperature: ',0
+xs4msg	dc.b 'degree F',$a,$d,'  error count: ',0  
+xs5msg	dc.b '  data logger pointer: ',0
+xserrmsg dc.b $a,$d,'No response from remote station, session timed out',0
+xserr1msg dc.b $a,$d,'Communication corrupted',0
+xdcancelmsg dc.b $a,$d,'xd command cancelled by user',0
+xd5msg	dc.b $a,$d,'Logged time: ',0
+xd5amsg dc.b $a,$d,'All data received',0
+	align 1
+******************* subroutines*************************
+*
+* clear a chunk of RAM area as pointed by a5
+clrRAMa5:
+	movem.l d0/a5,-(sp)	* save
+	move.w #$1000,d0		* clear a 16K block
+clrRAM0:
+	clr.l (a5)+
+	dbra d0,clrRAM0
+	movem.l (sp)+,d0/a5	* restore
+	rts
+*
+* clear the saved register area in the system RAM
+clrsavr:
+	lea savd0,a0		* savd0 is the beginning of register block
+	move.w #16,d0		* 17 registers total
+clrsavr0:
+	clr.l (a0)+
+	dbra d0,clrsavr0
+	clr.w (a0)+		* this clear the exception counter
+	lea $2F8000,a5		* $2F8000 to 2FBFFF is diagnostic area
+	bsr clrRAMa5
+	rts
+*
+* initialize the various buffers
+iBuffer:
+	move.b #$a,bAnswer	* start with LF, CR
+	move.b #$d,bAnswer+1
+	move.b #':',bAnswer+8	* separator
+	move.b #$a,bAnswer+13
+	move.b #$d,bAnswer+14
+	move.b #'>',bAnswer+15
+	move.b #' ',bAnswer+16
+	move.b #0,bAnswer+17	* zero terminator
+	rts
+
+*
+* initialize the DUART 68692, only lower byte is connected to data bus d0-d7
+* interrupt is connected to PB8 of 68302, nIACK is tied to VCC, need manual service
+* of interrupt
+iDUART:
+	move.w #$13,MRA		* write to MR1A as follow:
+			* no RxRTS, RxRDY int, Char error, no parity, 8 bits
+	move.w #$07,MRA		* now write to MR2A as follow:
+			* normal, no TxRTS, no CTS, 1 stop
+	move.w #$60,ACR		* clear ACR[7] bit
+	move.w #$CC,CSRA	* 38.4K baud
+	move.w #$0,IMRD		* mask off interrupt
+	move.w #$A,CRA		* disable Chan A transmit and receive
+	rts
+*
+* check for valid ascii representation of hexdecimal
+* d0 contains input, return 0xFF if invalid, otherwise hex value
+asc2hex:
+	cmp.b #'f',d0		
+	bhi aschex9		* not valid, >'f'
+	cmp.b #'a'-1,d0
+	bhi aschex1		* 'f'> valid >'a'
+	cmp.b #'F',d0		
+	bhi aschex9		* not valid, >'F'
+	cmp.b #'A'-1,d0
+	bhi aschex3		* 'F'> valid >'A'
+	cmp.b #'9',d0
+	bhi aschex9		* not valid >'9'
+	cmp.b #'0'-1,d0
+	bhi aschex2		* '9'> valid >'0'
+aschex9:
+	move.b #$FF,d0		* return 0xFF in not hex
+	bra aschex0
+aschex3:
+	sub.b #$37,d0
+	bra aschex0
+aschex2:
+	sub.b #$30,d0
+	bra aschex0
+aschex1:
+	sub.b #$57,d0		* 'a'-'f'
+aschex0:	
+	rts
+*
+* hex to ascii
+* byte value in d0.b is converted to ascii in d0.w
+hex2asc:
+	movem.l d1,-(sp)
+	move.b d0,d1
+	lsr.b #4,d1		* get the high nibble first
+	add.b #$30,d1
+	cmp.b #'9',d1		* '0' to '9'
+	bls hex2asc7
+	add.b #7,d1		* or 'A' to 'F'
+hex2asc7:
+	lsl.w #8,d1		* put result in high byte
+	move.b d0,d1		* work on the low nibble
+	and.b #$F,d1		* isolate low nibble
+	add.b #$30,d1
+	cmp.b #'9',d1		* '0' to '9'
+	bls hex2asc8
+	add.b #7,d1		* or 'A' to 'F'
+hex2asc8:
+	move.l d1,d0		* done
+	movem.l (sp)+,d1
+	rts
+*
+* convert content of register d0 into ASCII equivalent and store in RegASCII system buffer
+reg2ascii:
+	movem.l d1,-(sp)	* save
+	move.l d0,d1	* save a copy
+	rol.l #8,d0	* do MSB first
+	bsr hex2asc
+	move.w d0,RegASCII
+	move.l d1,d0	* restore the copy
+	swap d0		* do MUB next
+	bsr hex2asc
+	move.w d0,RegASCII+2
+	move.l d1,d0
+	ror.l #8,d0	* do MLB next
+	bsr hex2asc
+	move.w d0,RegASCII+4
+	move.l d1,d0	* do LSB last
+	bsr hex2asc
+	move.w d0,RegASCII+6
+	movem.l (sp)+,d1	* restore
+	rts
+*
+* transmit a null-terminated string pointed by a0
+TxStringA0:
+	movem.l d0,-(sp)	* save d0
+TxStr1:
+	btst.b #2,SRA+1		* look for transmit ready
+	beq TxStr1
+	move.b (a0)+,d0
+	beq Txstr9
+	move.b d0,THRA+1
+	bra TxStr1
+TxStr9:
+	btst.b #2,SRA+1		* wait for transmit done before restart
+	beq TxStr9
+	movem.l (sp)+,d0	* restore
+	rts
+*
+* transmit the content of d0 register
+TxRegD0:
+	movem.l d1/d2,-(sp)	* save
+	move.w #3,d2
+txregd01:
+	rol.l #8,d0	* do the MSB first
+	move.l d0,d1	* save a copy
+	bsr hex2asc
+	ror.w #8,d0	* print the high nibble of byte first
+	bsr txregd0q			
+	bsr txregd0q
+	move.l d1,d0
+	dbra d2,txregd01
+	movem.l (sp)+,d1/d2	* restore
+	rts
+txregd0q:
+	btst.b #2,SRA+1
+	beq txregd0q
+	move.b d0,THRA+1
+	ror.w #8,d0
+	rts
+* form the answer in buffer
+* d0 is the value, d1 is the address
+compuAnswer:
+	movem.l d1/d2,-(sp)	* save 
+	move.w d0,d2		* save a copy of d0
+	bsr hex2asc
+	move.b d0,bAnswer+12	
+	lsr.w #8,d0		* get the middle-lowerbyte
+	move.b d0,bAnswer+11	* get the LSB byte
+	move.w d2,d0
+	lsr.w #8,d0
+	bsr hex2asc
+	move.b d0,bAnswer+10	* do the MSB byte
+	lsr.w #8,d0
+	move.b d0,bAnswer+9
+	move.b d1,d0		* do the address value
+	bsr hex2asc
+	move.w d0,bAnswer+6	* LSW of address
+	lsr.l #8,d1
+	move.b d1,d0
+	bsr hex2asc
+	move.w d0,bAnswer+4	* middle word of address
+	lsr.l #8,d1
+	move.b d1,d0
+	bsr hex2asc
+	move.w d0,bAnswer+2	* MSW word of address (24-bit address)
+	movem.l (sp)+,d1/d2	* restore
+	rts
+time2string:
+* convert packed bcd representation of yymmddhhmmss stored in rtctimebcd into 
+* formated 20yy/mm/dd hh:mm:ss with null terminator in rtctime
+	movem.l d0-d1/a0,-(sp)	* save regs
+	lea rtctime,a0		* points to time storage
+	move.w #'20',(a0)+	* year is 20xx
+	move.l rtctimebcd,d0	* get yymmddhh
+	move.l d0,d1
+	and.l #$f0f0f0f0,d1	* pick out 2nd digit of yymmddhh
+	and.l #$0f0f0f0f,d0	* pick out 1st digit of yymmddhh
+	add.l #$30303030,d0	* convert to ascii
+	ror.l #4,d1
+	add.l #$30303030,d1	* convert to ascii
+	rol.l #8,d1
+	rol.l #8,d0
+	move.b d1,(a0)+		* yy/
+	move.b d0,(a0)+
+	move.b #'/',(a0)+
+	rol.l #8,d1
+	rol.l #8,d0
+	move.b d1,(a0)+		*mm/
+	move.b d0,(a0)+
+	move.b #'/',(a0)+
+	rol.l #8,d1
+	rol.l #8,d0
+	move.b d1,(a0)+		*dd + space
+	move.b d0,(a0)+
+	move.b #' ',(a0)+
+	rol.l #8,d1
+	rol.l #8,d0
+	move.b d1,(a0)+		*hh:
+	move.b d0,(a0)+
+	move.b #':',(a0)+	
+	move.w rtctimebcd+4,d0	* get mmss
+	move.l d0,d1
+	and.w #$f0f0,d1		* pick out 2nd digit of mmss
+	and.w #$0f0f,d0		* pick out 1st digit of mmss
+	ror.w #4,d1
+	add.w #$3030,d0		* convert to ascii
+	add.w #$3030,d1	
+	rol.w #8,d1
+	rol.w #8,d0
+	move.b d1,(a0)+		* mm:
+	move.b d0,(a0)+
+	move.b #':',(a0)+
+	rol.w #8,d1
+	rol.w #8,d0
+	move.b d1,(a0)+		* ss + null 
+	move.b d0,(a0)+
+	move.b #0,(a0)+	
+	movem.l (sp)+,d0-d1/a0
+	rts	
+*@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+*
+* unexpected exception
+* stay here and blink light green at 1/10 second and red at 1/5 second
+unknown:
+	add.w #1,cUErr
+	movem.l d0-d7/a0-a7,savd0	* save away registers
+	move.l $2(sp),savpc
+unknown3:
+	move.w #$0408,PBDAT	* green LED
+	move.l #77000,d0	* 100ms of spin
+unknown1:
+	sub.l #1,d0
+	bne unknown1
+	move.w #0,PBDAT		* red LED
+	move.l #154000,d0	* 200ms of red
+unknown2:
+	sub.l #1,d0
+	bne unknown2
+	bra unknown3		* never exit here
+*
+* address error
+* stay here and blink light red/green at 1/5 second rate
+addrerr:
+	add.w #$100,cUErr
+	movem.l d0-d7/a0-a7,savd0	* save away registers
+	move.l $A(sp),savpc
+
+	lea addrerrmsg(pc),a0
+	bsr TxStringA0
+	move.l 2(sp),d0		* print the access address
+	bsr TxRegD0
+	lea pcmsg(pc),a0	* print program counter
+	bsr TxStringA0
+	move.l $a(sp),d0
+	bsr TxRegD0
+	bra unknown		* blink lights forever
+*
+* Use illegal instruction as breakpoint.  original instruction is stored in bkptinstr
+* 
+breakpt:
+	movem.l d0-d7/a0-a7,savd0	* save all registers
+	move.l 2(sp),d0		* get the breakpoint address
+	cmp.l bkptaddr,d0	* if equal, this is the user specified breakpoint
+	bne breakpt8
+	lea bkptmsg(pc),a1	* print breakpoint message
+	lea bkptaddr,a0		* breakpoint location
+	bsr do_dr_reg
+	tst.b fbpverbose	* if verbose flag is set, display all registers
+	bne breakpt1
+	pea bppromptnc(pc)
+	move.l (sp)+,pStr
+	bra breakpt2
+breakpt1:	
+	bsr displayall
+	pea bpprompt(pc)	* put out prompt for breakpoint session
+	move.l (sp)+,pStr
+breakpt2:
+	move.l 2(sp),a0
+	move.w bkptinstr,(a0)	* restore original instruction
+	clr.l bkptaddr		* remove breakpoint
+	move.b #1,fdobkpt
+	clr.b cCmd		* ready for next command
+	clr.b fDoCmd
+	move.l #bCmdline,pCmdln
+	move.w #3,IMRD		* enable tx/rx interrupt
+bpcmdloop:
+	bsr wUserInput		* wait for user input	
+	cmp.b #0,cCmd		* if a carriage return, do one trace instruction
+	beq do_crlf
+	cmp.b #2,cCmd		* need at least 2 char in command line before
+				* a valid CR
+	blo badbpcmd
+	lea bpmnemonictbl(pc),a0	* point to command mnemonic
+	lea bpcommands(pc),a1	* the corresponding command entry point
+	move.w bCmdline,d0	* current command
+parsebpcmd:
+	cmp.w (a0)+,d0		* look for command
+	beq bpcmdproc
+	add.l #4,a1		* bump to next command
+	cmp.w #0,(a0)		* end of mnemonic table?
+	beq badbpcmd
+	bra parsebpcmd
+bpcmdproc:
+	bsr cmdreformat
+	clr.b cCmd		* ready for next command while current command is running
+	clr.b fDoCmd
+	move.l #bCmdline,pCmdln
+	tst.l d0
+	bne badbpcmd
+	move.l (a1),a1		* get the actual subroutine address in a1
+exec_bpcmd:
+	jsr (pc,a1)		* PC relative jsr
+*	jsr (a1)
+	tst.w d0		* test result to chose the right prompt
+	beq nobpcmd
+badbpcmd:
+	pea bpqprompt(pc)		* load error prompt
+	move.l (sp)+,pStr
+	bra nobpcmd9
+nobpcmd:
+	pea bpprompt(pc)		* a different way to put string address into pStr
+	move.l (sp)+,pStr	* bounce off stack so no register is altered
+nobpcmd9:
+	clr.b cCmd		* ready for next command
+	clr.b fDoCmd
+	move.l #bCmdline,pCmdln
+	move.w #3,IMRD		* enable tx/rx interrupt
+	bra bpcmdloop
+do_crlf:			* carriage return trace one instruction
+	clr.w cTrace
+	move.w (sp),d0		* locate the status register of breakpoint exception
+	and.w #$3FFF,d0		* enable trace
+	or.w #$8000,d0
+	move.w d0,(sp)
+	bra breakpt9
+do_tr:
+	clr.w cTrace		* clear the trace count for now
+	cmp.b #1,cCmdparam	* expect one parameters
+	bhi do_tr8
+	cmp.b #0,cCmdparam	* if no parameter, do trace once
+	beq do_tr4
+	move.w cmdparam+2,cTrace	* trace loop count	
+do_tr4:
+	move.w 4(sp),d0		* locate the status register for breakpoint
+	and.w #$3FFF,d0		* trace every instruction
+	or.w #$8000,d0
+	move.w d0,4(sp)
+	add.l #4,sp		* adjust stack, not returning back to subroutine
+	bra breakpt9		* exit breapoint exception with specified trace bits
+do_tr8:
+	move.l #1,d0		* return to BP session with error prompt
+	rts
+breakpt8:	
+	lea illegalmsg(pc),a0
+	bsr TxStringA0
+	move.l 2(sp),d0
+	bsr TxRegD0
+	bsr do_dr1		* display all registers
+	bra unknown
+do_goto:
+	cmp.b #0,cCmdparam	* expect zero or one parameter
+	beq do_gt2
+	cmp.b #1,cCmdparam
+	bne do_tr8		* same error handling as in trace parameter handling
+	move.l cmdparam,bkptaddr	* save to bkpt address
+	move.l cmdparam,a0
+	move.w (a0),bkptinstr	* save the instruction
+	move.w #$48FC,(a0)	* insert illegal instruction to specified location
+do_gt2:
+	move.w 4(sp),d0		* locate the status register for breakpoint
+	and.w #$3FFF,d0		* turn trace bits to zero
+	move.w d0,4(sp)		* put it back
+	add.l #4,sp		* adjust stack, not returning back to subroutine
+breakpt9:
+	clr.b cCmd		* ready for next command
+	clr.b fDoCmd
+	move.l #bCmdline,pCmdln
+	clr.b fdobkpt		* clear the breakpoint in progress flag
+	movem.l savd0,d0-d7/a0-a7	* restore registers	
+	rte	
+
+* BP command dispatch tables
+* the "-$12" is derived by trial and error.  Don't know why it works this way
+bpcommands:
+	dc.l do_dm-exec_bpcmd-$12	* display memory
+	dc.l do_bp_dr-exec_bpcmd-$12	* display register
+	dc.l do_mm-exec_bpcmd-$12	* modify memory
+	dc.l do_bp_mr-exec_bpcmd-$12	* modify register
+	dc.l do_goto-exec_bpcmd-$12	* go till next breakpoint
+	dc.l do_bp-exec_bpcmd-$12	* breakpoint
+	dc.l do_tr-exec_bpcmd-$12	* trace
+	dc.l do_vb-exec_bpcmd-$12	* verbose flag
+	dc.l do_bphelp-exec_bpcmd-$12	* help message		
+* corresponding mnemonic for the breakpoint command table
+bpmnemonictbl:
+	dc.w 'dm'
+	dc.w 'dr'
+	dc.w 'mm'
+	dc.w 'mr'
+	dc.w 'gt'
+	dc.w 'bp'
+	dc.w 'tr'
+	dc.w 'vb'
+	dc.w 'he'
+	dc.w $0	
+
+***********************BP commands***************************
+do_vb:
+* toggle the verbose mode, whatever additional parameters are ignored
+	tst.b fbpverbose
+	bne do_vb2
+	pea verbosemsg(pc)
+	move.l (sp)+,pStr
+	move.b #1,fbpverbose	* verbose mode is On
+	bra do_vb9
+do_vb2:
+	move.b #0,fbpverbose	* verbose mode is off
+	pea simplemsg(pc)
+	move.l (sp)+,pStr
+do_vb9:	
+	move.b #3,IMRD		* enable chan A TxRdy/RxRdy interrupts
+	move.b #False,fTxDone
+	bsr wTxDone
+	clr.l d0
+	clr.b exitCode		** normal exit
+	move.b #1,fCmdDone	* flag the command is finished
+	rts
+do_bphelp:
+	pea bphelpmsg(pc)	* print out help message
+	move.l (sp)+,pStr
+	move.b #3,IMRD		* enable Chan A TxRDY/RxRdy interrupts
+	move.b #False,fTxDone
+	bsr wTxDone
+	clr.l d0
+	clr.b exitCode		** normal exit
+	move.b #1,fCmdDone	* flag the command is finished	
+	rts
+
+displayall:
+	lea regD0short(pc),a1
+	lea savd0,a0
+	bsr do_dr_reg
+	lea regD1short(pc),a1
+	lea savd1,a0
+	bsr do_dr_reg
+	lea regD2short(pc),a1
+	lea savd2,a0
+	bsr do_dr_reg
+	lea regD3short(pc),a1
+	lea savd3,a0
+	bsr do_dr_reg
+	lea regD4short(pc),a1
+	lea savd4,a0
+	bsr do_dr_reg
+	lea regD5short(pc),a1
+	lea savd5,a0
+	bsr do_dr_reg	
+	lea regD6short(pc),a1
+	lea savd6,a0
+	bsr do_dr_reg	
+	lea regD7short(pc),a1
+	lea savd7,a0
+	bsr do_dr_reg	
+	
+	lea regA0short(pc),a1
+	lea savA0,a0
+	bsr do_dr_reg
+	lea regA1short(pc),a1
+	lea savA1,a0
+	bsr do_dr_reg
+	lea regA2short(pc),a1
+	lea savA2,a0
+	bsr do_dr_reg
+	lea regA3short(pc),a1
+	lea savA3,a0
+	bsr do_dr_reg
+	lea regA4short(pc),a1
+	lea savA4,a0
+	bsr do_dr_reg
+	lea regA5short(pc),a1
+	lea savA5,a0
+	bsr do_dr_reg	
+	lea regA6short(pc),a1
+	lea savA6,a0
+	bsr do_dr_reg	
+	lea regA7short(pc),a1
+	lea savsp,a0
+	bsr do_dr_reg
+	rts
+	
+*
+* trace exception handling
+* display PC, status, and instruction
+trace:
+	movem.l d0-d7/a0-a7,savd0	* save all registers
+	clr.b cCmd		* ready for next command
+	clr.b fDoCmd
+	move.l #bCmdline,pCmdln
+trace1:
+	lea tracemsg(pc),a0
+	bsr TxStringA0		* send out trace message
+	move.l 2(sp),a0		* get program counter of instruction
+	move.l (a0),d0		* get the instruction being traced
+	bsr TxRegD0
+	lea tracepcmsg(pc),a0
+	bsr TxStringA0		* next line of trace message
+	move.l 2(sp),d0
+	bsr TxRegD0		* print pc value
+	lea tracestmsg(pc),a0
+	bsr TxStringA0
+	clr.l d0
+	move.w (sp),d0
+	bsr TxRegD0
+	sub.w #1,cTrace		* decrement trace loop count
+				* if zero, no more trace, insert breakpoint for next instruction
+	bgt trace7
+trace5:
+	move.w (sp),d0
+	and.w #$3FFF,d0		* remove trace
+	move.w d0,(sp)		* put back status word
+	move.l 2(sp),a0		* breakpoint for next instruction
+	move.w (a0),bkptinstr	* save original instruction
+	move.w #$48FC,(a0)	* illegal instruction
+	move.l 2(sp),bkptaddr	* save away breakpoint address
+	bra trace9
+trace7:
+	tst.b fbpverbose
+	beq trace9
+	bsr displayall
+trace9:
+	movem.l savd0,d0-d7/a0-a7
+	rte
+*
+* Interrupt service for timer1, this is activated every 10ms
+* update the wallclocks, decrement task's downtimer if it is not zero already
+* 
+timer1isr:
+	add.l #1,wallclock
+	add.l #1,$2f1004	* do the same with wallclock of other 3 tasks
+	add.l #1,$2f2004
+	add.l #1,$2f3004
+	tst.w downtimer		* if downtimer is not zero, decrement it
+	beq timer1isr1a
+	sub.w #1,downtimer
+timer1isr1a:
+	tst.w $2f1008		* do the same with downtimer of other 3 tasks
+	beq timer1isr1b
+	sub.w #1,$2f1008
+timer1isr1b:
+	tst.w $2f2008
+	beq timer1isr1bb
+	sub.w #1,$2f2008
+timer1isr1bb:
+	tst.w $2f200a		* needs 2 timer channels for xbee task
+	beq timer1isr1c
+	sub.w #1,$2f200a
+timer1isr1c:
+	tst.w $2f3008
+	beq timer1isr1d
+	sub.w #1,$2f3008
+timer1isr1d:
+	move.b #$3,TER1		* clear event flag
+	move.w #$200,ISR	* clear the timer1 in-service interrupt bit
+	rte
+*
+* interrupt service for TxRdyA
+* look at receive data first and process if needed and shut off background transmit
+* then look at transmit data.  If in the middle of transmitting, keep on transmitting
+* send next byte as pointed by a2.  When zero is encountered, shut off the transmitter
+DUARTisr:
+	movem.l d0-d4/a0-a2,-(sp)	* save
+	btst.b #0,SRA+1		* look at receiver first
+	beq chktx		* if no char received, check char to send
+	move.w RHRA,d3		* get character
+	tst.b cCmd		* if non zero, fill command buffer til CR
+	bne getcmdline
+	cmp.b #'R',d3
+	beq dorwg
+	cmp.b #'W',d3
+	beq dorwg
+	cmp.b #'G',d3
+	beq dorwg
+	cmp.b #'Z',d3
+	beq doz
+	cmp.b #'S',d3
+	beq doSRload
+getCmdline:
+	cmp.b #$d,d3		* CR terminates the command line
+	bne echo_rx		* if not CR, echo back the char entered in the command buffer
+	move.b #1,fDoCmd	* make command ready to execute
+	move.l pCmdln,a0
+	cmp.b #' ',-1(a0)	* if trailing space, discard the space character
+	beq gobackone
+	bra edisr1
+echo_rx:
+	btst.b #2,SRA+1		* echo back 
+	beq echo_rx
+	cmp.b #8,d3		* backspace?
+	beq echo_rubout
+	move.b d3,THRA+1
+	bra chkextrasp
+*	cmp.b #8,d3		* backspace?
+*	bne chkextrasp
+echo_rubout
+	move.b #$8,THRA+1	* try rubout character instead of 0x8, didn't work
+	tst.b cCmd		* don't backspace past the first character
+	beq what_no_CR		* try this approach, no perfect either
+*	beq what		* is this better? confusion during mm session
+*	beq edisr1		* debate about this approach
+gobackone:
+	sub.l #1,pCmdln		* backspace, go back one character
+	sub.b #1,cCmd
+	bra edisr1		* get next character
+chkextrasp:
+	move.l pCmdln,a0	* get pointer into command line buffer
+	cmp.b #' ',d3		* if extra space, do not store
+	bne fillcmdbuf
+	cmp.b #' ',-1(a0)		* if previous is also space
+	beq edisr1
+fillcmdbuf
+	move.b d3,(a0)
+	add.l #1,pCmdln		* bump up one character	
+	add.b #1,cCmd
+	cmp.b #20,cCmd		* up to 20 characters. 
+	bne edisr1
+what:
+*	move.l #qprompt,pStr	* send '?> ' 
+	pea qprompt(pc)		* push error prompt pointer into stack
+	move.l (sp)+,pStr	* pStr points to error prompt string
+	clr.b fDoCmd		* abort command ready
+	clr.b cCmd		* reset command line 
+	move.l #bCmdline,pCmdln
+	bra txen
+what_no_CR:
+	pea q_no_cr(pc)		* put a single ? mark
+	move.l (sp)+,pStr
+	clr.b fDoCmd		* abort command ready
+	clr.b cCmd		* reset command line 
+	move.l #bCmdline,pCmdln
+	bra txen
+dorwg:
+	btst.b #2,SRA+1		* echo back character
+	beq dorwg
+	move.b d3,THRA+1	* echo back 'r' or 'w', 'g'
+	clr.l d1		* d1 is the address pointer
+	clr.l d4		* d4 is modified value for write command
+	clr.b fWval		* existance of valid value for read/write cmd
+* handle read/write the same, but the 2nd parameter has different meaning:
+* for read, it indicates how many words to print
+* for write, it indicates the modified value
+* if 2nd parameter is not present, read the current address and write nothing
+sp_1st:
+	btst.b #0,SRA+1		* loop for the 1st space char after command
+	beq sp_1st
+	move.w RHRA,d0		
+	cmp.b #' ',d0
+	bne dorwg5		* valid inputs at this point are hex values
+	bra echo_chr		* echo back
+more_sp:
+	tst.b fWval
+	bne what		* if fWval already set and ' ' entered print ?>
+	move.b #1,fWval		* mark write cmd with valid value
+	bra echo_chr		* echo back
+get_char:
+	btst.b #0,SRA+1		* look for character
+	beq get_char
+	move.w RHRA,d0		* check for valid characters
+	cmp.b #' ',d0
+	beq more_sp		* space is separator for read/write
+	cmp.b #$d,d0
+	beq dorwg9		* CR also marks the end of command
+dorwg5:
+	move.b d0,d2		* save a copy
+	bsr asc2hex
+	cmp.b #$FF,d0		* valid hex?
+	beq what		
+	tst.b fWval		* r address or w data?
+	bne dorwg6
+	lsl.l #4,d1		* shift existing value one nibble to left
+	add.b d0,d1		* append new address to existing one.
+dorwg7:
+	move.b d2,d0		* echo back	
+echo_chr:
+	btst.b #2,SRA+1
+	beq echo_chr
+	move.w d0,THRA		* echo back typed char
+	bra get_char		* get more data
+dorwg6:
+	lsl.l #4,d4		* d4 contains the second parameter
+	add.b d0,d4
+	bra dorwg7
+dorwg9:
+	and.l #$00FFFFFE,d1	* make sure it is even address and 24-bit addr
+	move.l d1,a0
+	cmp.b #'W',d3
+	beq dowrite
+	cmp.b #'G',d3
+	beq dorunrun
+	tst.w d4		* if d4 equals 0, do one line of display memory
+	beq dorwg8
+	sub.w #1,d4		* for read cmd, print the number of words specified by d4
+dorwg8:
+	move.w (a0),d0		* read the specified memory location
+	bsr compuAnswer		* forming the answer in buffer
+	move.l #bAnswer,pStr	* send out the answer
+	cmp.b #'W',d3		* if write cmd, print the memory content outside of ISR
+	beq txen		* if read cmd, print number of words specified by d4
+	tst.b fwval		* check valid 2nd parameter for read cmd
+	beq txen		* if no 2nd parameter, print the memory content outside of ISR
+	lea bAnswer,a2
+	move.b #0,bAnswer+13	* modify the bAnswer message string so not to print prompt
+dorwg8b:
+	btst.b #2,SRA+1		* txRdy
+	beq dorwg8b
+	move.b (a2)+,d0
+	beq dorwg8c
+	move.b d0,THRA+1
+	bra dorwg8b	
+dorwg8c:
+	add.l #2,a0		* next memory content, a0 contains the address value
+	move.l a0,d1		* 
+	dbra d4,dorwg8		* else print memory content d4 times within ISR
+	move.b #$a,bAnswer+13	* replace the prompt back into bAnswer message string
+	bra txprompt		* put out a prompt
+dorunrun:
+	clr.l d0		* status is passed back in d0
+	jsr (a0)		* jump into whatever address user is entered
+	tst.l d0
+	bne what
+txprompt:
+*	move.l #prompt,pStr	* print the prompt
+	lea prompt(pc),a0	* relocatable code
+	move.l a0,pStr		* pStr points to prompt string
+txen:
+	move.w #3,IMRD		* enable tx/rx interrupts
+	bra edisr1		
+dowrite:
+	tst.b fWval		* chk for valid write value
+	beq dorwg8		* don't write if invalid
+	move.w d4,(a0)		* write value out
+	bra dorwg8		* read back value
+* clear memory
+doz:
+	btst.b #2,SRA+1		* echo back
+	beq doz
+	move.w d3,THRA
+doz1:
+	btst.b #0,SRA+1		* read next char, must be $0d
+	beq doz1
+	move.w RHRA,d0
+	cmp.b #$d,d0
+	bne what
+	bsr clrsavr
+*	tst.b fwval
+*	beq doz9
+*	tst.l d1		* if 1st parameter is blank or zero do not clear mem
+*	beq doz9
+*	move.l d1,a5
+*	bsr clrRAMa5
+*doz9:
+	lea zmemmsg(pc),a0
+	move.l a0,pStr
+	bra txen
+*
+* S record format as generated by qlink, ignore S0
+* only echo back '.' per S record. send prompt if OK, send qprompt if error
+* S1: byte count, 16 bit address, end with checksum 
+* a0 is address, d1 is data, store value as they are received
+* d2 is nibble count, d3 is srecord byte count, d4 is accumulated checksum
+doSRload:
+	move.w #$2700,sr	* mask off all interrupt so vector table can be
+				* modified without crashing the code
+	bra doload1
+doload:
+*	move.w #$2700,sr	* mask off all interrupt so vector table can be
+				* modified without crashing the code
+	btst.b #0,SRA+1		* look for another 'S'
+	beq doload
+	move.w RHRA,d0
+	cmp.b #$d,d0		* put out '.' when CR encountered
+	bne doload2
+	tst.b fSerr		* if error, put out '?'
+	beq doload3
+	clr.b fSerr
+	move.b #1,fSerrAll	* flag S record error in file load
+	move.b #'?',THRA+1
+	bra doload2
+doload3:
+	move.b #'.',THRA+1
+doload2:
+	cmp.b #'S',d0
+	bne doload
+doload1:
+	btst.b #0,SRA+1		* look for S1 or exit with ?>
+	beq doload1
+	move.w RHRA,d0
+	cmp.b #'0',d0
+	beq doload
+	cmp.b #'1',d0
+	beq doS1
+	cmp.b #'2',d0
+	beq doS2
+	cmp.b #'8',d0		* S8 record?
+	beq doS8
+	cmp.b #'9',d0		* S9 record?
+	beq doS9
+	not.b fSerr		* mark the line as error
+	bra doload
+
+doS8:
+* if the address field is 0, or there are checksum error, exit
+* if the address field is non zero, and no checksum error, jump to the specified address
+* There are only 4 bytes: 3-byte address and checksum 
+	clr.l d4		* prepare checksum
+	move.w #1,d2		* get Srecord byte count
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum
+	cmp.b #4,d1		* should have a length of 4 exactly
+	bne doS8x
+	move.w #5,d2		* get 3-byte starting address
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum, low address
+	ror.l #8,d1
+	add.b d1,d4		* accumulate checksum, mid address
+	ror.l #8,d1
+	add.b d1,d4		* accumulate checksum, high address
+	ror.l #8,d1
+	ror.l #8,d1		* restore original value
+	move.l d1,startaddr	* save the start address
+	not.b d4		* checksum expected next
+	move.w #1,d2
+	bsr char2hex
+	cmp.b d1,d4		* compare calculated checksum
+	bne doS8x
+	tst.b fSerrAll		* check for total error count
+	bne doS8x
+	bsr wCRquitX		* wait for CR and mark end of SR load before continuing
+	tst.l startaddr		* If starting address is 0, return to prompt
+	beq doS8y
+	lea runSrecord(pc),a0	* notify S record is loaded and running
+	bsr TxStringA0		* not using interrupt service to put out string	
+
+* delay 0.1 second before jump into application
+	move.l #$77000,d6	* diagnostic
+w2abit:
+	sub.l #1,d6		* diagnostic
+	bne w2abit		* diagnostic
+
+	move.l startaddr,a1	* else jump into the start address
+	jsr (a1)			
+	lea rundoneSR(pc),a0	* notify that s record execution completed
+	bsr TxStringA0	
+doS8y:	
+	lea prompt(pc),a0	* relocatable code
+	move.l a0,pStr		* pStr points to prompt string
+	bra txen
+doS8x:
+	bsr wCRquitX		* wait for CR and exit SR loader
+	pea qprompt(pc)
+	move.l (sp)+,pStr
+	clr.b fSerrAll
+	bra txen	
+doS9:
+* if the address field is 0, or there are checksum error, exit
+* if the address field is non zero, and no checksum error, jump to the specified address
+* There are only 3 bytes: 2-byte address and checksum 
+	clr.l d4		* prepare checksum
+	move.w #1,d2		* get Srecord byte count
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum
+	cmp.b #3,d1		* should have a length of 3 exactly
+	bne doS9x
+	move.w #3,d2		* get 2-byte starting address
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum, lower address
+	ror.w #8,d1
+	add.b d1,d4		* accumulate checksum, higher address
+	ror.w #8,d1		* restore original value
+	move.l d1,startaddr	* save the start address
+	not.b d4		* checksum expected next
+	move.w #1,d2
+	bsr char2hex
+	cmp.b d1,d4		* compare calculated checksum
+	bne doS9x
+	tst.b fSerrAll		* check for total error count
+	bne doS9x
+	bsr wCRquitX		* wait for CR and mark end of SR load before continuing
+	tst.l startaddr		* If starting address is 0, return to prompt
+	beq doS9y
+	lea runSrecord(pc),a0	* notify S record is loaded and running
+	bsr TxStringA0		* not using interrupt service to put out string	
+* delay 0.1 second before jump into application
+	move.l #$77000,d6	* diagnostic
+w1abit:
+	sub.l #1,d6		* diagnostic
+	bne w1abit		* diagnostic
+
+	move.l startaddr,a1	* else jump into the start address
+	jsr (a1)			
+	lea rundoneSR(pc),a0	* notify that s record execution completed
+	bsr TxStringA0
+doS9y:	
+	lea prompt(pc),a0	* relocatable code
+	move.l a0,pStr		* pStr points to prompt string
+	bra txen
+doS9x:
+	bsr wCRquitX		* wait for CR and exit SR loader
+	pea qprompt(pc)
+	move.l (sp)+,pStr
+	clr.b fSerrAll
+	bra txen
+doS1:
+	clr.l d4
+	move.w #1,d2		* get Srecord byte count
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum
+	move.w d1,d3
+	sub.w #4,d3		* don't count CRC byte nor 2-byte address		
+	move.w #3,d2		* get 2-byte starting address
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum, lower address
+	ror.w #8,d1		
+	add.b d1,d4		* accumulate checksum, higher address
+	ror.w #8,d1		* restore
+	move.l d1,a0
+srdata:
+	move.w #1,d2		* get byte data
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum
+	move.b d1,(a0)		* store value to destination
+	cmp.b (a0)+,d1		* write verify
+	beq srdatax
+	move.b #1,fSerr
+srdatax:	
+	dbra d3,srdata
+	not.b d4		* checksum expected
+	move.w #1,d2
+	bsr char2hex
+	cmp.b d1,d4
+	beq doload
+	move.b #1,fSerr		* send out a question mark
+	bra doload
+doS2:
+	clr.l d4
+	move.W #1,d2		* get Srecord byte count
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum
+	move.W d1,d3
+	sub.W #5,d3		* don't count CRC byte nor 3-byte address		
+	move.W #5,d2		* get 3-byte starting address
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum, lower address
+	ror.l #8,d1		
+	add.b d1,d4		* accumulate checksum, middle address
+	ror.l #8,d1		* 
+	add.b d1,d4		* accumulate checksum, upper address
+	ror.l #8,d1
+	ror.l #8,d1		* restore
+	move.l d1,a0
+srdata2:
+	move.w #1,d2		* get byte data
+	bsr char2hex
+	add.b d1,d4		* accumulate checksum
+	move.b d1,(a0)		* store value to destination
+	cmp.b (a0)+,d1		* write verify
+	beq srdata2x
+	move.b #1,fSerr		* flag if not able to write
+srdata2x:
+	dbra d3,srdata2
+	not.b d4		* checksum expected
+	move.w #1,d2
+	bsr char2hex
+	cmp.b d1,d4
+	beq doload
+	move.b #1,fSerr		* send out a question mark
+	bra doload	
+chktx:
+	btst.b #2,SRA+1		* look for transmit ready
+	beq edisr1		* nothing, exit
+	move.l pStr,a0		* load the string pointer
+	move.b (a0),d0
+	beq edisr		* null terminator
+	move.b d0,THRA+1	* put out the next byte as pointed by a0
+	add.l #1,pStr		* update the string pointer
+	bra edisr1	
+edisr:
+	move.w #2,IMRD		* mask off transmit interrupts
+	move.b #True,fTxDone	* flag transmission of string finished
+edisr1:
+	move.w #2,ISR		* clear in-service bit associated with DUART
+	movem.l (sp)+,d0-d4/a0-a2	* restore
+	rte
+* 
+* subroutine wait for CR then quit with 'X' output
+wCRquitX:
+	btst.b #0,SRA+1		* look for CR and quit
+	beq wCRquitX
+	move.w RHRA,d0
+	cmp.b #$d,d0
+	bne wCRquitX
+	move.b #'X',THRA+1
+wCRquitX1:
+	btst.b #2,SRA+1		* look for transmit done before returning
+	beq wCRquitX1
+	rts
+*
+* subroutine to get prescribed number of characters in d2, convert to hex and put in
+* d1 
+char2hex:
+	clr.l d1		* important to clear all d1 when start
+c2h1:
+	btst.b #0,SRA+1
+	beq c2h1
+	move.w RHRA,d0
+	bsr asc2hex
+	cmp.b #$FF,d0
+	bne c2h1_1
+	move.b #1,fSerr		* mark this as an error and go on
+c2h1_1:
+	lsl.l #4,d1		
+	add.b d0,d1		* append to existing value
+	dbra d2,c2h1
+	rts
+*
+* Bus error handling
+* print "Bus error" in polling mode and return
+buserr:
+	add.w #$1000,cUErr
+	movem.l d0-d7/a0-a7,savd0	* save away registers
+	move.l $A(sp),savpc
+
+	lea berrmsg(pc),a0
+	bsr TxStringA0
+	move.l 2(sp),d0		* print the access address
+	bsr TxRegD0
+	lea pcmsg(pc),a0	* print PC value
+	bsr TxStringA0
+	move.l $a(sp),d0
+	bsr TxRegD0
+	bra unknown		* blink lights forever
+
+	nop			* extra pad
+	nop
+
+	include lcd4x20.a68	* LCD display task
+
+	include Xbee.a68	* Xbee task
+
+* uncomment the include to program AMbug into boot flash.
+*	include prog010b.a68
+*	include p29f040.a68
+* that's all folks!
+
+	end restart
+	end
